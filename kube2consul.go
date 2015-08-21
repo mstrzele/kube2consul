@@ -60,6 +60,7 @@ const (
 type kube2consul struct {
 	// Consul client.
 	consulClient *consulapi.Client
+
 	// DNS domain name.
 	domain string
 
@@ -80,7 +81,11 @@ func Newkube2consul() *kube2consul {
 
 func (ks *kube2consul) removeDNS(record string) error {
 	glog.V(2).Infof("Removing %s from DNS", record)
-	return ks.consulClient.Agent().ServiceDeregister(record)
+	for _,id := range ks.ids[record] {
+		ks.consulClient.Agent().ServiceDeregister(id)
+	}
+	ks.ids[record] = []string{}
+	return nil
 }
 
 func (ks *kube2consul) addDNS(record string, service *kapi.Service) error {
@@ -104,7 +109,7 @@ func (ks *kube2consul) addDNS(record string, service *kapi.Service) error {
 					ID:			 newId,
 					Name: 	 record + "-" + service.Spec.Ports[i].Name,
 					Address: n,
-					Port:    service.Spec.Ports[i].NodePort,
+					//Port:    service.Spec.Ports[i].NodePort,
 				}
 
 				glog.V(2).Infof("Setting DNS record: %v -> %v:%d\n", record, service.Spec.ClusterIP, service.Spec.Ports[i].Port)
