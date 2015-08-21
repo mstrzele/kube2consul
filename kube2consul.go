@@ -18,7 +18,7 @@ limitations under the License.
 // Kubernetes master for changes in Services and creates new DNS records on the
 // consul agent.
 
-package main
+package main // import "github.com/jmccarty3/kube2consul"
 
 import (
 	"flag"
@@ -28,17 +28,20 @@ import (
 	"os"
 	"time"
 
-	kapi "github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	kclient "github.com/GoogleCloudPlatform/kubernetes/pkg/client"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/client/cache"
-	kclientcmd "github.com/GoogleCloudPlatform/kubernetes/pkg/client/clientcmd"
-	kclientcmdapi "github.com/GoogleCloudPlatform/kubernetes/pkg/client/clientcmd/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/controller/framework"
-	kcontrollerFramework "github.com/GoogleCloudPlatform/kubernetes/pkg/controller/framework"
-	kSelector "github.com/GoogleCloudPlatform/kubernetes/pkg/fields"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
+	kapi "k8s.io/kubernetes/pkg/api"
+	kclient "k8s.io/kubernetes/pkg/client/unversioned"
+	kcache "k8s.io/kubernetes/pkg/client/unversioned/cache"
+	kclientcmd "k8s.io/kubernetes/pkg/client/unversioned/clientcmd"
+	kframework "k8s.io/kubernetes/pkg/controller/framework"
+	kcontrollerFramework "k8s.io/kubernetes/pkg/controller/framework"
+	kSelector "k8s.io/kubernetes/pkg/fields"
+	"k8s.io/kubernetes/pkg/util"
 	"github.com/golang/glog"
 	consulapi "github.com/hashicorp/consul/api"
+
+  "k8s.io/kubernetes/pkg/api"
+  "k8s.io/kubernetes/pkg/fields"
+  "k8s.io/kubernetes/pkg/labels"
 )
 
 var (
@@ -59,6 +62,20 @@ type kube2consul struct {
 	consulClient *consulapi.Client
 	// DNS domain name.
 	domain string
+
+	//Nodes Name / valid
+	nodes map[string]bool
+
+	//DNS IDS
+	ids map[string][]string
+}
+
+func Newkube2consul() *kube2consul {
+	var k kube2consul
+	k.nodes = make(map[string]bool)
+	k.ids = make(map[string][]string)
+
+	return &k
 }
 
 func (ks *kube2consul) removeDNS(record string) error {
@@ -72,23 +89,30 @@ func (ks *kube2consul) addDNS(record string, service *kapi.Service) error {
 		return nil
 	}
 
-	// if PortalIP is not set, do not create a DNS records
+	// if ClusterIP is not set, do not create a DNS records
 	if !kapi.IsServiceIPSet(service) {
 		glog.V(1).Infof("Skipping dns record for headless service: %s\n", service.Name)
 		return nil
 	}
 
 	for i := range service.Spec.Ports {
-		asr := &consulapi.AgentServiceRegistration{
-			ID:			 record,
-			Name: 	 record,
-			Address: service.Spec.PortalIP,
-			Port:    service.Spec.Ports[0].Port,
-		}
+		for n,s := range ks.nodes {
+			if s {
+				newId := n+record + service.Spec.Ports[i].Name
 
-		glog.V(2).Infof("Setting DNS record: %v -> %v:%d\n", record, service.Spec.PortalIP, service.Spec.Ports[i].Port)
-		if err := ks.consulClient.Agent().ServiceRegister(asr); err != nil {
-			return err
+				asr := &consulapi.AgentServiceRegistration{
+					ID:			 newId,
+					Name: 	 record + "-" + service.Spec.Ports[i].Name,
+					Address: n,
+					Port:    service.Spec.Ports[i].NodePort,
+				}
+
+				glog.V(2).Infof("Setting DNS record: %v -> %v:%d\n", record, service.Spec.ClusterIP, service.Spec.Ports[i].Port)
+				if err := ks.consulClient.Agent().ServiceRegister(asr); err != nil {
+					return err
+				}
+				ks.ids[record] = append(ks.ids[record], newId)
+			}
 		}
 	}
 	return nil
@@ -166,13 +190,14 @@ func newKubeClient() (*kclient.Client, error) {
 	if *argKubecfgFile == "" {
 		config = &kclient.Config{
 			Host:    masterUrl,
-			Version: "v1beta3",
+			Version: "v1",
 		}
 	} else {
 		var err error
-		if config, err = kclientcmd.NewNonInteractiveDeferredLoadingClientConfig(
-			&kclientcmd.ClientConfigLoadingRules{ExplicitPath: *argKubecfgFile},
-			&kclientcmd.ConfigOverrides{ClusterInfo: kclientcmdapi.Cluster{Server: masterUrl, InsecureSkipTLSVerify: true}}).ClientConfig(); err != nil {
+		overrides := &kclientcmd.ConfigOverrides{}
+		overrides.ClusterInfo.Server = masterUrl                                     // might be "", but that is OK
+		rules := &kclientcmd.ClientConfigLoadingRules{ExplicitPath: *argKubecfgFile} // might be "", but that is OK
+		if config, err = kclientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, overrides).ClientConfig(); err != nil {
 			return nil, err
 		}
 	}
@@ -182,12 +207,18 @@ func newKubeClient() (*kclient.Client, error) {
 }
 
 func buildNameString(service, namespace string) string {
+	//glog.Infof("Name String: %s  %s", service, namespace)
 	return fmt.Sprintf("%s.%s", service, namespace)
 }
 
 // Returns a cache.ListWatch that gets all changes to services.
-func createServiceLW(kubeClient *kclient.Client) *cache.ListWatch {
-	return cache.NewListWatchFromClient(kubeClient, "services", kapi.NamespaceAll, kSelector.Everything())
+func createServiceLW(kubeClient *kclient.Client) *kcache.ListWatch {
+	return kcache.NewListWatchFromClient(kubeClient, "services", kapi.NamespaceAll, kSelector.Everything())
+}
+
+// Returns a cache.ListWatch that gets all changes to services.
+func createNodeLW(kubeClient *kclient.Client) *kcache.ListWatch {
+	return kcache.NewListWatchFromClient(kubeClient, "nodes", kapi.NamespaceAll, kSelector.Everything())
 }
 
 func (ks *kube2consul) newService(obj interface{}) {
@@ -200,6 +231,7 @@ func (ks *kube2consul) newService(obj interface{}) {
 }
 
 func (ks *kube2consul) removeService(obj interface{}) {
+	glog.Info("Service remove")
 	if s, ok := obj.(*kapi.Service); ok {
 		name := buildNameString(s.Name, s.Namespace)
 		if err := ks.removeDNS(s.Name); err != nil {
@@ -208,13 +240,29 @@ func (ks *kube2consul) removeService(obj interface{}) {
 	}
 }
 
+func (ks *kube2consul) updateNode(oldObj, newObj interface{}) {
+	if n, ok := oldObj.(*kapi.Node); ok {
+		name := n.Name
+		ready := n.Status.Conditions[0].Status == kapi.ConditionTrue
+
+		ks.nodes[name] = ready
+	}
+
+	if n, ok := newObj.(*kapi.Node); ok {
+		name := n.Name
+		ready := n.Status.Conditions[0].Status == kapi.ConditionTrue
+
+		ks.nodes[name] = ready
+	}
+}
+
 func watchForServices(kubeClient *kclient.Client, ks *kube2consul) {
 	var serviceController *kcontrollerFramework.Controller
-	_, serviceController = framework.NewInformer(
+	_, serviceController = kframework.NewInformer(
 		createServiceLW(kubeClient),
 		&kapi.Service{},
 		resyncPeriod,
-		framework.ResourceEventHandlerFuncs{
+		kframework.ResourceEventHandlerFuncs{
 			AddFunc:    ks.newService,
 			DeleteFunc: ks.removeService,
 			UpdateFunc: func(oldObj, newObj interface{}) {
@@ -222,23 +270,58 @@ func watchForServices(kubeClient *kclient.Client, ks *kube2consul) {
 			},
 		},
 	)
-	serviceController.Run(util.NeverStop)
+	glog.Info("About to call run!")
+	go serviceController.Run(util.NeverStop)
+}
+
+func watchForNodes(kubeClient *kclient.Client, ks *kube2consul) kcache.Store {
+	store, serviceController := kframework.NewInformer(
+		createNodeLW(kubeClient),
+		&kapi.Node{},
+		resyncPeriod,
+		kframework.ResourceEventHandlerFuncs{
+			AddFunc:    func(newObj interface{}) {
+				glog.Info("Adding node!")
+			},
+			DeleteFunc: func(oldObj interface{}) {
+				glog.Info("Node Removed!!")
+			},
+			UpdateFunc: ks.updateNode,
+		},
+	)
+	glog.Info("About to call run!")
+	go serviceController.Run(util.NeverStop)
+	return store
 }
 
 func main() {
 	flag.Parse()
 	var err error
 	// TODO: Validate input flags.
-	ks := kube2consul{}
+	ks := Newkube2consul()
 
 	if ks.consulClient, err = newConsulClient(*argConsulAgent); err != nil {
 		glog.Fatalf("Failed to create Consul client - %v", err)
 	}
+
 
 	kubeClient, err := newKubeClient()
 	if err != nil {
 		glog.Fatalf("Failed to create a kubernetes client: %v", err)
 	}
 
-	watchForServices(kubeClient, &ks)
+	glog.Info(kubeClient.ServerVersion())
+	glog.Info(kubeClient.Services(kapi.NamespaceAll).Get("sensu-core"))
+
+	pods, err := kubeClient.Pods(api.NamespaceDefault).List(labels.Everything(), fields.Everything())
+	if err != nil {
+	  for pod := range pods.Items {
+			glog.Info(pod)
+		}
+	}
+
+	watchForServices(kubeClient, ks)
+	watchForNodes(kubeClient, ks)
+	glog.Info("Watchers running")
+	select {}
 }
