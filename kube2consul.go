@@ -110,6 +110,7 @@ func (ks *kube2consul) addDNS(record string, service *kapi.Service) error {
 					Name: 	 record + "-" + service.Spec.Ports[i].Name,
 					Address: n,
 					Port:    service.Spec.Ports[i].NodePort,
+					Tags: []string{"Kube"},
 				}
 
 				glog.V(2).Infof("Setting DNS record: %v -> %v:%d\n", record, service.Spec.ClusterIP, service.Spec.Ports[i].Port)
