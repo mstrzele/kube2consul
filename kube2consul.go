@@ -57,6 +57,16 @@ const (
 	resyncPeriod = 5 * time.Second
 )
 
+type nodeInformation struct {
+	name string
+
+	address string
+
+	ready bool
+	// map[service] DNS IDs
+	ids map[string][]string
+}
+
 type kube2consul struct {
 	// Consul client.
 	consulClient *consulapi.Client
@@ -65,60 +75,73 @@ type kube2consul struct {
 	domain string
 
 	//Nodes Name / valid
-	nodes map[string]bool
+	nodes map[string]nodeInformation
 
-	//DNS IDS
-	ids map[string][]string
+	//All Services.
+	services map[string]*kapi.Service
 }
 
 func Newkube2consul() *kube2consul {
 	var k kube2consul
-	k.nodes = make(map[string]bool)
-	k.ids = make(map[string][]string)
+	k.nodes = make(map[string]nodeInformation)
+	k.services = make(map[string]*kapi.Service)
 
 	return &k
 }
 
-func (ks *kube2consul) removeDNS(record string) error {
-	glog.V(2).Infof("Removing %s from DNS", record)
-	for _,id := range ks.ids[record] {
-		ks.consulClient.Agent().ServiceDeregister(id)
+func NewnodeInformation() *nodeInformation {
+	var n nodeInformation
+	n.ready = false
+	n.ids = make(map[string][]string)
+
+	return &n
+}
+
+func Contains(s []string, e string) bool {
+	for _,i := range s {
+		if i == e {
+			return true
+		}
 	}
-	ks.ids[record] = []string{}
+	return false
+}
+
+func (ks *kube2consul) removeDNS(recordID string) error {
+	glog.Infof("Removing %s from DNS", recordID)
+	ks.consulClient.Agent().ServiceDeregister(recordID)
 	return nil
 }
 
-func (ks *kube2consul) addDNS(record string, service *kapi.Service) error {
+func (ks *kube2consul) createDNS(record string, service *kapi.Service, node *nodeInformation) error {
 	if strings.Contains(record, ".") {
-		glog.V(1).Infof("Service names containing '.' are not supported: %s\n", service.Name)
+		glog.Infof("Service names containing '.' are not supported: %s\n", service.Name)
 		return nil
 	}
 
 	// if ClusterIP is not set, do not create a DNS records
 	if !kapi.IsServiceIPSet(service) {
-		glog.V(1).Infof("Skipping dns record for headless service: %s\n", service.Name)
+		glog.Infof("Skipping dns record for headless service: %s\n", service.Name)
 		return nil
 	}
 
 	for i := range service.Spec.Ports {
-		for n,s := range ks.nodes {
-			if s {
-				newId := n+record + service.Spec.Ports[i].Name
+			newId := node.name+record + service.Spec.Ports[i].Name
 
-				asr := &consulapi.AgentServiceRegistration{
-					ID:			 newId,
-					Name: 	 record + "-" + service.Spec.Ports[i].Name,
-					Address: n,
-					Port:    service.Spec.Ports[i].NodePort,
-					Tags: []string{"Kube"},
-				}
+			asr := &consulapi.AgentServiceRegistration{
+				ID:			 newId,
+				Name: 	 record + "-" + service.Spec.Ports[i].Name,
+				Address: node.address,
+				Port:    service.Spec.Ports[i].NodePort,
+				Tags: []string{"Kube"},
+			}
 
-				glog.V(2).Infof("Setting DNS record: %v -> %v:%d\n", record, service.Spec.ClusterIP, service.Spec.Ports[i].Port)
+			if Contains(node.ids[record], newId) == false {
+				glog.Infof("Setting DNS record: %v -> %v:%d\n", asr.Name, asr.Address, asr.Port)
 				if err := ks.consulClient.Agent().ServiceRegister(asr); err != nil {
 					return err
 				}
-				ks.ids[record] = append(ks.ids[record], newId)
-			}
+
+				node.ids[record] = append(node.ids[record], newId)
 		}
 	}
 	return nil
@@ -214,7 +237,8 @@ func newKubeClient() (*kclient.Client, error) {
 
 func buildNameString(service, namespace string) string {
 	//glog.Infof("Name String: %s  %s", service, namespace)
-	return fmt.Sprintf("%s.%s", service, namespace)
+	//return fmt.Sprintf("%s.%s", service, namespace)
+	return fmt.Sprintf("%s", service)
 }
 
 // Returns a cache.ListWatch that gets all changes to services.
@@ -230,35 +254,80 @@ func createNodeLW(kubeClient *kclient.Client) *kcache.ListWatch {
 func (ks *kube2consul) newService(obj interface{}) {
 	if s, ok := obj.(*kapi.Service); ok {
 		name := buildNameString(s.Name, s.Namespace)
-		if err := ks.addDNS(s.Name, s); err != nil {
-			glog.V(1).Infof("Failed to add service: %v due to: %v", name, err)
+		ks.services[name] = s
+
+		glog.V(2).Info("Creating Service: ", name)
+		//Add to all existing nodes
+		for _,node := range ks.nodes {
+			if node.ready {
+				ks.createDNS(name, s, &node)
+			}
 		}
 	}
 }
 
 func (ks *kube2consul) removeService(obj interface{}) {
-	glog.Info("Service remove")
 	if s, ok := obj.(*kapi.Service); ok {
 		name := buildNameString(s.Name, s.Namespace)
-		if err := ks.removeDNS(s.Name); err != nil {
-			glog.V(1).Infof("Failed to remove service: %v due to: %v", name, err)
+		//Remove service from node
+		for _,node := range ks.nodes {
+			for _,id := range node.ids[name] {
+				ks.removeDNS(id)
+			}
+			delete(node.ids, name)
 		}
+		delete(ks.services,name)
 	}
 }
 
 func (ks *kube2consul) updateNode(oldObj, newObj interface{}) {
-	if n, ok := oldObj.(*kapi.Node); ok {
-		name := n.Name
-		ready := n.Status.Conditions[0].Status == kapi.ConditionTrue
-
-		ks.nodes[name] = ready
-	}
-
 	if n, ok := newObj.(*kapi.Node); ok {
-		name := n.Name
 		ready := n.Status.Conditions[0].Status == kapi.ConditionTrue
+		nodeInfo := ks.nodes[n.Name]
 
-		ks.nodes[name] = ready
+		if nodeInfo.ready != ready {
+			nodeInfo.ready = ready
+			if ready {
+				for serviceName, service := range ks.services {
+					ks.createDNS(serviceName, service, &nodeInfo)
+				}
+			}	else {
+				for _,serviceIDs := range nodeInfo.ids {
+					for _,serviceID := range serviceIDs {
+						ks.removeDNS(serviceID)
+					}
+				}
+				nodeInfo.ids = make(map[string][]string) //Clear tha map
+			}
+		}
+	}
+}
+
+func (ks *kube2consul) newNode(newObj interface{}) {
+	if node, ok := newObj.(*kapi.Node); ok {
+		if _, ok := ks.nodes[node.Name]; !ok {
+			glog.Info("Adding Node: ", node.Name)
+			var newNode = *NewnodeInformation()
+			newNode.name = node.Name
+			newNode.address = node.Status.Addresses[0].Address
+
+			ks.nodes[node.Name] = newNode
+		}
+	}
+}
+
+func (ks *kube2consul) removeNode(oldObj interface{}) {
+	if node, ok := oldObj.(*kapi.Node); ok {
+		if info, ok := ks.nodes[node.Name]; ok {
+			glog.Info("Removing Node: ", node.Name)
+			for _,idSet := range info.ids {
+				for _,id := range idSet {
+					ks.removeDNS(id)
+				}
+			}
+
+			delete(ks.nodes, node.Name)
+		}
 	}
 }
 
@@ -276,7 +345,6 @@ func watchForServices(kubeClient *kclient.Client, ks *kube2consul) {
 			},
 		},
 	)
-	glog.Info("About to call run!")
 	go serviceController.Run(util.NeverStop)
 }
 
@@ -286,12 +354,8 @@ func watchForNodes(kubeClient *kclient.Client, ks *kube2consul) kcache.Store {
 		&kapi.Node{},
 		resyncPeriod,
 		kframework.ResourceEventHandlerFuncs{
-			AddFunc:    func(newObj interface{}) {
-				glog.Info("Adding node!")
-			},
-			DeleteFunc: func(oldObj interface{}) {
-				glog.Info("Node Removed!!")
-			},
+			AddFunc: ks.newNode,
+			DeleteFunc: ks.removeNode,
 			UpdateFunc: ks.updateNode,
 		},
 	)
