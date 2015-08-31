@@ -341,7 +341,10 @@ func watchForServices(kubeClient *kclient.Client, ks *kube2consul) {
 			AddFunc:    ks.newService,
 			DeleteFunc: ks.removeService,
 			UpdateFunc: func(oldObj, newObj interface{}) {
-				ks.newService(newObj)
+				if oldObj != newObj {
+					ks.removeService(oldObj)
+					ks.newService(newObj)
+				}
 			},
 		},
 	)
