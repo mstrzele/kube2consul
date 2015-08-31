@@ -27,6 +27,7 @@ import (
 	"net/url"
 	"os"
 	"time"
+	"reflect"
 
 	kapi "k8s.io/kubernetes/pkg/api"
 	kclient "k8s.io/kubernetes/pkg/client/unversioned"
@@ -280,6 +281,17 @@ func (ks *kube2consul) removeService(obj interface{}) {
 	}
 }
 
+func (ks *kube2consul) updateService(oldObj, newObj interface{}) {
+	if old, ok := oldObj.(*kapi.Service); ok {
+		if new, ok := newObj.(*kapi.Service); ok {
+			if reflect.DeepEqual(*old, *new) == false {
+				ks.removeService(old)
+				ks.newService(new)
+			}
+		}
+	}
+}
+
 func (ks *kube2consul) updateNode(oldObj, newObj interface{}) {
 	if n, ok := newObj.(*kapi.Node); ok {
 		ready := n.Status.Conditions[0].Status == kapi.ConditionTrue
@@ -340,12 +352,7 @@ func watchForServices(kubeClient *kclient.Client, ks *kube2consul) {
 		kframework.ResourceEventHandlerFuncs{
 			AddFunc:    ks.newService,
 			DeleteFunc: ks.removeService,
-			UpdateFunc: func(oldObj, newObj interface{}) {
-				if oldObj != newObj {
-					ks.removeService(oldObj)
-					ks.newService(newObj)
-				}
-			},
+			UpdateFunc: ks.updateService,
 		},
 	)
 	go serviceController.Run(util.NeverStop)
