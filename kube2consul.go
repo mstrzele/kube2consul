@@ -31,7 +31,7 @@ import (
 
 	kapi "k8s.io/kubernetes/pkg/api"
 	kclient "k8s.io/kubernetes/pkg/client/unversioned"
-	kcache "k8s.io/kubernetes/pkg/client/unversioned/cache"
+	kcache "k8s.io/kubernetes/pkg/client/cache"
 	kclientcmd "k8s.io/kubernetes/pkg/client/unversioned/clientcmd"
 	kframework "k8s.io/kubernetes/pkg/controller/framework"
 	kcontrollerFramework "k8s.io/kubernetes/pkg/controller/framework"
@@ -127,12 +127,12 @@ func (ks *kube2consul) createDNS(record string, service *kapi.Service, node *nod
 
 	for i := range service.Spec.Ports {
 			newId := node.name+record + service.Spec.Ports[i].Name
+      var asrName string
 
 			if len(service.Spec.Ports[i].Name) > 0 {
-				asrName := record + "-" + service.Spec.Ports[i].Name
-			}
-			else {
-				asrName := record
+				asrName = record + "-" + service.Spec.Ports[i].Name
+			} else {
+				asrName = record
 			}
 
 			asr := &consulapi.AgentServiceRegistration{
