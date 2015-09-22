@@ -128,9 +128,16 @@ func (ks *kube2consul) createDNS(record string, service *kapi.Service, node *nod
 	for i := range service.Spec.Ports {
 			newId := node.name+record + service.Spec.Ports[i].Name
 
+			if len(service.Spec.Ports[i].Name) > 0 {
+				asrName := record + "-" + service.Spec.Ports[i].Name
+			}
+			else {
+				asrName := record
+			}
+
 			asr := &consulapi.AgentServiceRegistration{
 				ID:			 newId,
-				Name: 	 record + "-" + service.Spec.Ports[i].Name,
+				Name: 	 asrName,
 				Address: node.address,
 				Port:    service.Spec.Ports[i].NodePort,
 				Tags: []string{"Kube"},
