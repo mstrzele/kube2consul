@@ -28,6 +28,7 @@ import (
 	"os"
 	"time"
 	"reflect"
+	"strconv"
 
 	kapi "k8s.io/kubernetes/pkg/api"
 	kclient "k8s.io/kubernetes/pkg/client/unversioned"
@@ -128,24 +129,30 @@ func (ks *kube2consul) createDNS(record string, service *kapi.Service, node *nod
 		return nil
 	}
 
+	//Currently this is only for NodePorts.
+	if service.Spec.Type != kapi.ServiceTypeNodePort {
+		glog.V(3).Infof("Skipping non-NodePort service: %s\n", service.Name)
+		return nil
+	}
+
 	for i := range service.Spec.Ports {
 			newId := node.name+record + service.Spec.Ports[i].Name
       var asrName string
-			var asrPort int
 
+			//If the port has a name. Use that.
 			if len(service.Spec.Ports[i].Name) > 0 {
 				asrName = record + "-" + service.Spec.Ports[i].Name
-				asrPort = int(service.Spec.Ports[i].NodePort)
-			} else {
+			} else if len(service.Spec.Ports) == 1 { //TODO: Pull out logic later
 				asrName = record
-				asrPort = service.Spec.Ports[i].TargetPort.IntVal
+			} else {
+				asrName = record + "-" + strconv.Itoa(service.Spec.Ports[i].Port)
 			}
 
 			asr := &consulapi.AgentServiceRegistration{
 				ID:			 newId,
 				Name: 	 asrName,
 				Address: node.address,
-				Port:    asrPort,
+				Port:    service.Spec.Ports[i].NodePort,
 				Tags: []string{"Kube"},
 			}
 
