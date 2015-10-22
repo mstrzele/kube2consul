@@ -40,15 +40,16 @@ import (
 	"github.com/golang/glog"
 	consulapi "github.com/hashicorp/consul/api"
 
-  "k8s.io/kubernetes/pkg/api"
-  "k8s.io/kubernetes/pkg/fields"
-  "k8s.io/kubernetes/pkg/labels"
+//  "k8s.io/kubernetes/pkg/api"
+//  "k8s.io/kubernetes/pkg/fields"
+//  "k8s.io/kubernetes/pkg/labels"
 )
 
 var (
 	argConsulAgent         = flag.String("consul-agent", "http://127.0.0.1:8500", "URL to consul agent")
 	argKubecfgFile         = flag.String("kubecfg_file", "", "Location of kubecfg file for access to kubernetes service")
 	argKubeMasterUrl       = flag.String("kube_master_url", "https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}", "Url to reach kubernetes master. Env variables in this flag will be expanded.")
+	argDryRun              = flag.Bool("dryrun", false, "Runs without connecting to consul")
 )
 
 const (
@@ -109,7 +110,9 @@ func Contains(s []string, e string) bool {
 
 func (ks *kube2consul) removeDNS(recordID string) error {
 	glog.Infof("Removing %s from DNS", recordID)
-	ks.consulClient.Agent().ServiceDeregister(recordID)
+	if ks.consulClient != nil {
+		ks.consulClient.Agent().ServiceDeregister(recordID)
+	}
 	return nil
 }
 
@@ -128,25 +131,31 @@ func (ks *kube2consul) createDNS(record string, service *kapi.Service, node *nod
 	for i := range service.Spec.Ports {
 			newId := node.name+record + service.Spec.Ports[i].Name
       var asrName string
+			var asrPort int
 
 			if len(service.Spec.Ports[i].Name) > 0 {
 				asrName = record + "-" + service.Spec.Ports[i].Name
+				asrPort = int(service.Spec.Ports[i].NodePort)
 			} else {
 				asrName = record
+				asrPort = service.Spec.Ports[i].TargetPort.IntVal
 			}
 
 			asr := &consulapi.AgentServiceRegistration{
 				ID:			 newId,
 				Name: 	 asrName,
 				Address: node.address,
-				Port:    service.Spec.Ports[i].NodePort,
+				Port:    asrPort,
 				Tags: []string{"Kube"},
 			}
 
 			if Contains(node.ids[record], newId) == false {
 				glog.Infof("Setting DNS record: %v -> %v:%d\n", asr.Name, asr.Address, asr.Port)
-				if err := ks.consulClient.Agent().ServiceRegister(asr); err != nil {
-					return err
+
+				if ks.consulClient != nil {
+					if err := ks.consulClient.Agent().ServiceRegister(asr); err != nil {
+						return err
+					}
 				}
 
 				node.ids[record] = append(node.ids[record], newId)
@@ -387,10 +396,13 @@ func main() {
 	// TODO: Validate input flags.
 	ks := Newkube2consul()
 
-	if ks.consulClient, err = newConsulClient(*argConsulAgent); err != nil {
-		glog.Fatalf("Failed to create Consul client - %v", err)
+	if *argDryRun {
+		glog.Info("Dryrun started. Ignoring Consul")
+	} else {
+		if ks.consulClient, err = newConsulClient(*argConsulAgent); err != nil {
+			glog.Fatalf("Failed to create Consul client - %v", err)
+		}
 	}
-
 
 	kubeClient, err := newKubeClient()
 	if err != nil {
@@ -398,14 +410,6 @@ func main() {
 	}
 
 	glog.Info(kubeClient.ServerVersion())
-	glog.Info(kubeClient.Services(kapi.NamespaceAll).Get("sensu-core"))
-
-	pods, err := kubeClient.Pods(api.NamespaceDefault).List(labels.Everything(), fields.Everything())
-	if err != nil {
-	  for pod := range pods.Items {
-			glog.Info(pod)
-		}
-	}
 
 	watchForServices(kubeClient, ks)
 	watchForNodes(kubeClient, ks)
