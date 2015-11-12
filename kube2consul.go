@@ -23,34 +23,34 @@ package main // import "github.com/jmccarty3/kube2consul"
 import (
 	"flag"
 	"fmt"
-	"strings"
 	"net/url"
 	"os"
-	"time"
 	"reflect"
 	"strconv"
+	"strings"
+	"time"
 
-	kapi "k8s.io/kubernetes/pkg/api"
-	kclient "k8s.io/kubernetes/pkg/client/unversioned"
-	kcache "k8s.io/kubernetes/pkg/client/cache"
-	kclientcmd "k8s.io/kubernetes/pkg/client/unversioned/clientcmd"
-	kframework "k8s.io/kubernetes/pkg/controller/framework"
-	kcontrollerFramework "k8s.io/kubernetes/pkg/controller/framework"
-	kSelector "k8s.io/kubernetes/pkg/fields"
-	"k8s.io/kubernetes/pkg/util"
 	"github.com/golang/glog"
 	consulapi "github.com/hashicorp/consul/api"
+	kapi "k8s.io/kubernetes/pkg/api"
+	kcache "k8s.io/kubernetes/pkg/client/cache"
+	kclient "k8s.io/kubernetes/pkg/client/unversioned"
+	kclientcmd "k8s.io/kubernetes/pkg/client/unversioned/clientcmd"
+	kcontrollerFramework "k8s.io/kubernetes/pkg/controller/framework"
+	kframework "k8s.io/kubernetes/pkg/controller/framework"
+	kSelector "k8s.io/kubernetes/pkg/fields"
+	"k8s.io/kubernetes/pkg/util"
 
-//  "k8s.io/kubernetes/pkg/api"
-//  "k8s.io/kubernetes/pkg/fields"
-//  "k8s.io/kubernetes/pkg/labels"
+	//  "k8s.io/kubernetes/pkg/api"
+	//  "k8s.io/kubernetes/pkg/fields"
+	//  "k8s.io/kubernetes/pkg/labels"
 )
 
 var (
-	argConsulAgent         = flag.String("consul-agent", "http://127.0.0.1:8500", "URL to consul agent")
-	argKubecfgFile         = flag.String("kubecfg_file", "", "Location of kubecfg file for access to kubernetes service")
-	argKubeMasterUrl       = flag.String("kube_master_url", "https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}", "Url to reach kubernetes master. Env variables in this flag will be expanded.")
-	argDryRun              = flag.Bool("dryrun", false, "Runs without connecting to consul")
+	argConsulAgent   = flag.String("consul-agent", "http://127.0.0.1:8500", "URL to consul agent")
+	argKubecfgFile   = flag.String("kubecfg_file", "", "Location of kubecfg file for access to kubernetes service")
+	argKubeMasterUrl = flag.String("kube_master_url", "https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}", "Url to reach kubernetes master. Env variables in this flag will be expanded.")
+	argDryRun        = flag.Bool("dryrun", false, "Runs without connecting to consul")
 )
 
 const (
@@ -101,7 +101,7 @@ func NewnodeInformation() *nodeInformation {
 }
 
 func Contains(s []string, e string) bool {
-	for _,i := range s {
+	for _, i := range s {
 		if i == e {
 			return true
 		}
@@ -136,36 +136,36 @@ func (ks *kube2consul) createDNS(record string, service *kapi.Service, node *nod
 	}
 
 	for i := range service.Spec.Ports {
-			newId := node.name+record + service.Spec.Ports[i].Name
-      var asrName string
+		newId := node.name + record + service.Spec.Ports[i].Name
+		var asrName string
 
-			//If the port has a name. Use that.
-			if len(service.Spec.Ports[i].Name) > 0 {
-				asrName = record + "-" + service.Spec.Ports[i].Name
-			} else if len(service.Spec.Ports) == 1 { //TODO: Pull out logic later
-				asrName = record
-			} else {
-				asrName = record + "-" + strconv.Itoa(service.Spec.Ports[i].Port)
-			}
+		//If the port has a name. Use that.
+		if len(service.Spec.Ports[i].Name) > 0 {
+			asrName = record + "-" + service.Spec.Ports[i].Name
+		} else if len(service.Spec.Ports) == 1 { //TODO: Pull out logic later
+			asrName = record
+		} else {
+			asrName = record + "-" + strconv.Itoa(service.Spec.Ports[i].Port)
+		}
 
-			asr := &consulapi.AgentServiceRegistration{
-				ID:			 newId,
-				Name: 	 asrName,
-				Address: node.address,
-				Port:    service.Spec.Ports[i].NodePort,
-				Tags: []string{"Kube"},
-			}
+		asr := &consulapi.AgentServiceRegistration{
+			ID:      newId,
+			Name:    asrName,
+			Address: node.address,
+			Port:    service.Spec.Ports[i].NodePort,
+			Tags:    []string{"Kube"},
+		}
 
-			if Contains(node.ids[record], newId) == false {
-				glog.Infof("Setting DNS record: %v -> %v:%d\n", asr.Name, asr.Address, asr.Port)
+		if Contains(node.ids[record], newId) == false {
+			glog.Infof("Setting DNS record: %v -> %v:%d\n", asr.Name, asr.Address, asr.Port)
 
-				if ks.consulClient != nil {
-					if err := ks.consulClient.Agent().ServiceRegister(asr); err != nil {
-						return err
-					}
+			if ks.consulClient != nil {
+				if err := ks.consulClient.Agent().ServiceRegister(asr); err != nil {
+					return err
 				}
+			}
 
-				node.ids[record] = append(node.ids[record], newId)
+			node.ids[record] = append(node.ids[record], newId)
 		}
 	}
 	return nil
@@ -180,12 +180,12 @@ func newConsulClient(consulAgent string) (*consulapi.Client, error) {
 	consulConfig := consulapi.DefaultConfig()
 	consulAgentUrl, err := url.Parse(consulAgent)
 	if err != nil {
-			glog.Infof("Error parsing Consul url")
-			return nil, err
+		glog.Infof("Error parsing Consul url")
+		return nil, err
 	}
 
 	if consulAgentUrl.Host != "" {
-	  consulConfig.Address = consulAgentUrl.Host
+		consulConfig.Address = consulAgentUrl.Host
 	}
 
 	if consulAgentUrl.Scheme != "" {
@@ -194,8 +194,8 @@ func newConsulClient(consulAgent string) (*consulapi.Client, error) {
 
 	client, err = consulapi.NewClient(consulConfig)
 	if err != nil {
-			glog.Infof("Error creating Consul client")
-			return nil, err
+		glog.Infof("Error creating Consul client")
+		return nil, err
 	}
 
 	for attempt := 1; attempt <= maxConnectAttempts; attempt++ {
@@ -282,7 +282,7 @@ func (ks *kube2consul) newService(obj interface{}) {
 
 		glog.V(2).Info("Creating Service: ", name)
 		//Add to all existing nodes
-		for _,node := range ks.nodes {
+		for _, node := range ks.nodes {
 			if node.ready {
 				ks.createDNS(name, s, &node)
 			}
@@ -294,13 +294,13 @@ func (ks *kube2consul) removeService(obj interface{}) {
 	if s, ok := obj.(*kapi.Service); ok {
 		name := buildNameString(s.Name, s.Namespace)
 		//Remove service from node
-		for _,node := range ks.nodes {
-			for _,id := range node.ids[name] {
+		for _, node := range ks.nodes {
+			for _, id := range node.ids[name] {
 				ks.removeDNS(id)
 			}
 			delete(node.ids, name)
 		}
-		delete(ks.services,name)
+		delete(ks.services, name)
 	}
 }
 
@@ -326,9 +326,9 @@ func (ks *kube2consul) updateNode(oldObj, newObj interface{}) {
 				for serviceName, service := range ks.services {
 					ks.createDNS(serviceName, service, &nodeInfo)
 				}
-			}	else {
-				for _,serviceIDs := range nodeInfo.ids {
-					for _,serviceID := range serviceIDs {
+			} else {
+				for _, serviceIDs := range nodeInfo.ids {
+					for _, serviceID := range serviceIDs {
 						ks.removeDNS(serviceID)
 					}
 				}
@@ -355,8 +355,8 @@ func (ks *kube2consul) removeNode(oldObj interface{}) {
 	if node, ok := oldObj.(*kapi.Node); ok {
 		if info, ok := ks.nodes[node.Name]; ok {
 			glog.Info("Removing Node: ", node.Name)
-			for _,idSet := range info.ids {
-				for _,id := range idSet {
+			for _, idSet := range info.ids {
+				for _, id := range idSet {
 					ks.removeDNS(id)
 				}
 			}
@@ -387,7 +387,7 @@ func watchForNodes(kubeClient *kclient.Client, ks *kube2consul) kcache.Store {
 		&kapi.Node{},
 		resyncPeriod,
 		kframework.ResourceEventHandlerFuncs{
-			AddFunc: ks.newNode,
+			AddFunc:    ks.newNode,
 			DeleteFunc: ks.removeNode,
 			UpdateFunc: ks.updateNode,
 		},
