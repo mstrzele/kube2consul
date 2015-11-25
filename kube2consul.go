@@ -153,7 +153,7 @@ func (ks *kube2consul) createDNS(record string, service *kapi.Service, node *nod
 			Name:    asrName,
 			Address: node.address,
 			Port:    service.Spec.Ports[i].NodePort,
-			Tags:    []string{"Kube"},
+			Tags:    []string{"Kube", service.Spec.Ports[i].Protocol},
 		}
 
 		if Contains(node.ids[record], newId) == false {
