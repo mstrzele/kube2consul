@@ -153,11 +153,11 @@ func (ks *kube2consul) createDNS(record string, service *kapi.Service, node *nod
 			Name:    asrName,
 			Address: node.address,
 			Port:    service.Spec.Ports[i].NodePort,
-			Tags:    []string{"Kube", service.Spec.Ports[i].Protocol},
+			Tags:    []string{"Kube", string(service.Spec.Ports[i].Protocol) },
 		}
 
 		if Contains(node.ids[record], newId) == false {
-			glog.Infof("Setting DNS record: %v -> %v:%d\n", asr.Name, asr.Address, asr.Port)
+			glog.Infof("Setting DNS record: %v -> %v:%d with protocol %v\n", asr.Name, asr.Address, asr.Port, string(service.Spec.Ports[i].Protocol))
 
 			if ks.consulClient != nil {
 				if err := ks.consulClient.Agent().ServiceRegister(asr); err != nil {
