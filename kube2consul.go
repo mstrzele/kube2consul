@@ -51,6 +51,7 @@ var (
 	argKubecfgFile   = flag.String("kubecfg_file", "", "Location of kubecfg file for access to kubernetes service")
 	argKubeMasterUrl = flag.String("kube_master_url", "https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}", "Url to reach kubernetes master. Env variables in this flag will be expanded.")
 	argDryRun        = flag.Bool("dryrun", false, "Runs without connecting to consul")
+	argChecks        = flag.Bool("checks", false, "Adds TCP service checks for each TCP Service")
 )
 
 const (
@@ -148,19 +149,29 @@ func (ks *kube2consul) createDNS(record string, service *kapi.Service, node *nod
 			asrName = record + "-" + strconv.Itoa(service.Spec.Ports[i].Port)
 		}
 
-		asr := &consulapi.AgentServiceRegistration{
-			ID:      newId,
-			Name:    asrName,
-			Address: node.address,
-			Port:    service.Spec.Ports[i].NodePort,
-			Tags:    []string{"Kube", string(service.Spec.Ports[i].Protocol) },
-		}
-
 		if Contains(node.ids[record], newId) == false {
+			asr := &consulapi.AgentServiceRegistration{
+				ID:      newId,
+				Name:    asrName,
+				Address: node.address,
+				Port:    service.Spec.Ports[i].NodePort,
+				Tags:    []string{"Kube", string(service.Spec.Ports[i].Protocol) },
+			}
+
+			if *argChecks && service.Spec.Ports[i].Protocol == "TCP" {
+				target := string(node.address) + ":" + strconv.Itoa(service.Spec.Ports[i].NodePort)
+				glog.Infof("Created Service check for: %v on %v\n", asr.Name, target)
+				asr.Check = &consulapi.AgentServiceCheck {
+					TCP: target,
+					Interval: "60s",
+				}
+			}
+
 			glog.Infof("Setting DNS record: %v -> %v:%d with protocol %v\n", asr.Name, asr.Address, asr.Port, string(service.Spec.Ports[i].Protocol))
 
 			if ks.consulClient != nil {
 				if err := ks.consulClient.Agent().ServiceRegister(asr); err != nil {
+					glog.Errorf("Error registering with consul: %v\n", err)
 					return err
 				}
 			}
