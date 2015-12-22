@@ -332,6 +332,7 @@ func (ks *kube2consul) updateNode(oldObj, newObj interface{}) {
 		nodeInfo := ks.nodes[n.Name]
 
 		if nodeInfo.ready != ready {
+			glog.Infoln("Updating node:", n.Name, "with to ready status:", ready)
 			nodeInfo.ready = ready
 			if ready {
 				for serviceName, service := range ks.services {
@@ -345,6 +346,8 @@ func (ks *kube2consul) updateNode(oldObj, newObj interface{}) {
 				}
 				nodeInfo.ids = make(map[string][]string) //Clear tha map
 			}
+
+			ks.nodes[n.Name] = nodeInfo
 		}
 	}
 }
@@ -373,6 +376,8 @@ func (ks *kube2consul) removeNode(oldObj interface{}) {
 			}
 
 			delete(ks.nodes, node.Name)
+		}	else {
+			glog.Infoln("Attempted to remove node ", node.Name, " not in inventory")
 		}
 	}
 }
