@@ -119,6 +119,7 @@ func (ks *kube2consul) removeDNS(recordID string) error {
 }
 
 func (ks *kube2consul) createDNS(record string, service *kapi.Service, node *nodeInformation) error {
+	glog.V(4).Info("Starting DNS creation for", service.Name)
 	if strings.Contains(record, ".") {
 		glog.Infof("Service names containing '.' are not supported: %s\n", service.Name)
 		return nil
@@ -179,6 +180,8 @@ func (ks *kube2consul) createDNS(record string, service *kapi.Service, node *nod
 			node.ids[record] = append(node.ids[record], newId)
 		}
 	}
+
+	glog.V(4).Info("Finished DNS creation for", service.Name)
 	return nil
 }
 
@@ -296,6 +299,8 @@ func (ks *kube2consul) newService(obj interface{}) {
 		for _, node := range ks.nodes {
 			if node.ready {
 				ks.createDNS(name, s, &node)
+			} else {
+				glog.V(4).Info("Skipping node ", node.name, " as not ready" )
 			}
 		}
 	}
@@ -326,10 +331,23 @@ func (ks *kube2consul) updateService(oldObj, newObj interface{}) {
 	}
 }
 
+func nodeReady(node *kapi.Node) bool {
+	for  i := range node.Status.Conditions {
+		if node.Status.Conditions[i].Type == kapi.NodeReady {
+			return node.Status.Conditions[i].Status == kapi.ConditionTrue
+		}
+	}
+
+	glog.Error("NodeReady condition is missing from node: ", node.Name)
+	return false
+}
+
 func (ks *kube2consul) updateNode(oldObj, newObj interface{}) {
 	if n, ok := newObj.(*kapi.Node); ok {
-		ready := n.Status.Conditions[0].Status == kapi.ConditionTrue
+		ready := nodeReady(n)
 		nodeInfo := ks.nodes[n.Name]
+
+		glog.V(4).Info("Update Node request: ", n.Name)
 
 		if nodeInfo.ready != ready {
 			glog.Infoln("Updating node:", n.Name, "with to ready status:", ready)
@@ -355,11 +373,12 @@ func (ks *kube2consul) updateNode(oldObj, newObj interface{}) {
 func (ks *kube2consul) newNode(newObj interface{}) {
 	if node, ok := newObj.(*kapi.Node); ok {
 		if _, ok := ks.nodes[node.Name]; !ok {
-			glog.Info("Adding Node: ", node.Name)
 			var newNode = *NewnodeInformation()
 			newNode.name = node.Name
 			newNode.address = node.Status.Addresses[0].Address
+			newNode.ready = nodeReady(node)
 
+			glog.Info("Adding Node: ", node.Name, " Ready State:", newNode.ready, "  Stored:", node.Status.Conditions[0].Status)
 			ks.nodes[node.Name] = newNode
 		}
 	}
