@@ -331,6 +331,12 @@ func (ks *kube2consul) updateService(oldObj, newObj interface{}) {
 	}
 }
 
+func (ks *kube2consul) addNodeServices(nodeInfo *nodeInformation) {
+	for serviceName, service := range ks.services {
+		ks.createDNS(serviceName, service, nodeInfo)
+	}
+}
+
 func nodeReady(node *kapi.Node) bool {
 	for  i := range node.Status.Conditions {
 		if node.Status.Conditions[i].Type == kapi.NodeReady {
@@ -353,9 +359,7 @@ func (ks *kube2consul) updateNode(oldObj, newObj interface{}) {
 			glog.Infoln("Updating node:", n.Name, "with to ready status:", ready)
 			nodeInfo.ready = ready
 			if ready {
-				for serviceName, service := range ks.services {
-					ks.createDNS(serviceName, service, &nodeInfo)
-				}
+				ks.addNodeServices(&nodeInfo)
 			} else {
 				for _, serviceIDs := range nodeInfo.ids {
 					for _, serviceID := range serviceIDs {
@@ -380,6 +384,10 @@ func (ks *kube2consul) newNode(newObj interface{}) {
 
 			glog.Info("Adding Node: ", node.Name, " Ready State:", newNode.ready, "  Stored:", node.Status.Conditions[0].Status)
 			ks.nodes[node.Name] = newNode
+
+			if newNode.ready {
+				ks.addNodeServices(&newNode)
+			}
 		}
 	}
 }
