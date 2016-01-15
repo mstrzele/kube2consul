@@ -25,26 +25,15 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"reflect"
-	"strconv"
-	"strings"
 	"time"
-
 	"github.com/golang/glog"
-	consulapi "github.com/hashicorp/consul/api"
-	kapi "k8s.io/kubernetes/pkg/api"
-	kcache "k8s.io/kubernetes/pkg/client/cache"
+
+	//"github.com/google/cadvisor/info/v1"
+	//"github.com/imdario/mergo"
 	kclient "k8s.io/kubernetes/pkg/client/unversioned"
 	kclientcmd "k8s.io/kubernetes/pkg/client/unversioned/clientcmd"
-	kcontrollerFramework "k8s.io/kubernetes/pkg/controller/framework"
-	kframework "k8s.io/kubernetes/pkg/controller/framework"
-	kSelector "k8s.io/kubernetes/pkg/fields"
-	"k8s.io/kubernetes/pkg/util"
-
-	//  "k8s.io/kubernetes/pkg/api"
-	//  "k8s.io/kubernetes/pkg/fields"
-	//  "k8s.io/kubernetes/pkg/labels"
 )
+
 
 var (
 	argConsulAgent   = flag.String("consul-agent", "http://127.0.0.1:8500", "URL to consul agent")
@@ -61,30 +50,8 @@ const (
 	resyncPeriod = 5 * time.Second
 )
 
-type nodeInformation struct {
-	name string
 
-	address string
-
-	ready bool
-	// map[service] DNS IDs
-	ids map[string][]string
-}
-
-type kube2consul struct {
-	// Consul client.
-	consulClient *consulapi.Client
-
-	// DNS domain name.
-	domain string
-
-	//Nodes Name / valid
-	nodes map[string]nodeInformation
-
-	//All Services.
-	services map[string]*kapi.Service
-}
-
+/*
 func Newkube2consul() *kube2consul {
 	var k kube2consul
 	k.nodes = make(map[string]nodeInformation)
@@ -92,14 +59,7 @@ func Newkube2consul() *kube2consul {
 
 	return &k
 }
-
-func NewnodeInformation() *nodeInformation {
-	var n nodeInformation
-	n.ready = false
-	n.ids = make(map[string][]string)
-
-	return &n
-}
+*/
 
 func Contains(s []string, e string) bool {
 	for _, i := range s {
@@ -114,6 +74,7 @@ func getKubeMasterUrl() (string, error) {
 	if *argKubeMasterUrl == "" {
 		return "", fmt.Errorf("no --kube_master_url specified")
 	}
+
 	parsedUrl, err := url.Parse(os.ExpandEnv(*argKubeMasterUrl))
 	if err != nil {
 		return "", fmt.Errorf("failed to parse --kube_master_url %s - %v", *argKubeMasterUrl, err)
@@ -121,122 +82,67 @@ func getKubeMasterUrl() (string, error) {
 	if parsedUrl.Scheme == "" || parsedUrl.Host == "" || parsedUrl.Host == ":" {
 		return "", fmt.Errorf("invalid --kube_master_url specified %s", *argKubeMasterUrl)
 	}
+
+	glog.Info("Parsed Master URL:", parsedUrl.String())
 	return parsedUrl.String(), nil
 }
 
-// TODO: evaluate using pkg/client/clientcmd
-func newKubeClient() (*kclient.Client, error) {
-	var config *kclient.Config
-	masterUrl, err := getKubeMasterUrl()
-	if err != nil {
-		return nil, err
-	}
-	if *argKubecfgFile == "" {
-		config = &kclient.Config{
-			Host:    masterUrl,
-			Version: "v1",
-		}
-	} else {
-		var err error
-		overrides := &kclientcmd.ConfigOverrides{}
-		overrides.ClusterInfo.Server = masterUrl                                     // might be "", but that is OK
-		rules := &kclientcmd.ClientConfigLoadingRules{ExplicitPath: *argKubecfgFile} // might be "", but that is OK
-		if config, err = kclientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, overrides).ClientConfig(); err != nil {
-			return nil, err
-		}
-	}
-	glog.Infof("Using %s for kubernetes master", config.Host)
-	glog.Infof("Using kubernetes API %s", config.Version)
-	return kclient.New(config)
-}
-
-func buildNameString(service, namespace string) string {
+//Take Service Object and Node
+/*
+func buildNameString(service *Service) string {
 	//glog.Infof("Name String: %s  %s", service, namespace)
 	//return fmt.Sprintf("%s.%s", service, namespace)
 	return fmt.Sprintf("%s", service)
 }
+*/
 
-// Returns a cache.ListWatch that gets all changes to services.
-func createServiceLW(kubeClient *kclient.Client) *kcache.ListWatch {
-	return kcache.NewListWatchFromClient(kubeClient, "services", kapi.NamespaceAll, kSelector.Everything())
-}
-
-// Returns a cache.ListWatch that gets all changes to services.
-func createNodeLW(kubeClient *kclient.Client) *kcache.ListWatch {
-	return kcache.NewListWatchFromClient(kubeClient, "nodes", kapi.NamespaceAll, kSelector.Everything())
-}
-
-func (ks *kube2consul) newService(obj interface{}) {
-	if s, ok := obj.(*kapi.Service); ok {
-		name := buildNameString(s.Name, s.Namespace)
-		ks.services[name] = s
-
-		glog.V(2).Info("Creating Service: ", name)
-		//Add to all existing nodes
-		for _, node := range ks.nodes {
-			if node.ready {
-				ks.createDNS(name, s, &node)
-			}
-		}
+func createKubeClient() (*kclient.Client, error) {
+	masterUrl, err := getKubeMasterUrl()
+	if err != nil {
+		return nil, err
 	}
-}
 
+	overrides := &kclientcmd.ConfigOverrides{}
+	overrides.ClusterInfo.Server = masterUrl
 
+	glog.Info("Overrids server:", overrides.ClusterInfo.Server)
 
-func watchForServices(kubeClient *kclient.Client, ks *kube2consul) {
-	var serviceController *kcontrollerFramework.Controller
-	_, serviceController = kframework.NewInformer(
-		createServiceLW(kubeClient),
-		&kapi.Service{},
-		resyncPeriod,
-		kframework.ResourceEventHandlerFuncs{
-			AddFunc:    ks.newService,
-			DeleteFunc: ks.removeService,
-			UpdateFunc: ks.updateService,
-		},
-	)
-	go serviceController.Run(util.NeverStop)
-}
+	rules := kclientcmd.NewDefaultClientConfigLoadingRules()
+	kubeConfig, err := kclientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, overrides).ClientConfig()
 
-func watchForNodes(kubeClient *kclient.Client, ks *kube2consul) kcache.Store {
-	store, serviceController := kframework.NewInformer(
-		createNodeLW(kubeClient),
-		&kapi.Node{},
-		resyncPeriod,
-		kframework.ResourceEventHandlerFuncs{
-			AddFunc:    ks.newNode,
-			DeleteFunc: ks.removeNode,
-			UpdateFunc: ks.updateNode,
-		},
-	)
-	glog.Info("About to call run!")
-	go serviceController.Run(util.NeverStop)
-	return store
+	kubeConfig.Host = masterUrl
+	if err != nil {
+		glog.Error("Error creating Kube Config", err)
+		return nil, err
+	}
+	glog.Infof("Using %s for kubernetes master", kubeConfig.Host)
+	glog.Infof("Using kubernetes API %s", kubeConfig.Version)
+	return kclient.New(kubeConfig)
 }
 
 func main() {
 	flag.Parse()
-	var err error
-	// TODO: Validate input flags.
-	ks := Newkube2consul()
 
-	if *argDryRun {
-		glog.Info("Dryrun started. Ignoring Consul")
-	} else {
-		if ks.consulClient, err = newConsulClient(*argConsulAgent); err != nil {
-			glog.Fatalf("Failed to create Consul client - %v", err)
-		}
-	}
-
-	kubeClient, err := newKubeClient()
+	//Attempt to create Kube Client
+	kubeClient, err := createKubeClient()
 	if err != nil {
-		glog.Fatalf("Failed to create a kubernetes client: %v", err)
+		glog.Fatal("Could not connect to Kube Master", err)
 	}
 
-	glog.Info(kubeClient.ServerVersion())
+	if _, err := kubeClient.ServerVersion(); err != nil {
+		glog.Fatal("Could not connect to Kube Master", err)
+	} else {
+		glog.Info("Connected to K8S API Server")
+	}
+	//Attempt to create Consul Client (All ways needed so that channels are not blocked)
 
-	watchForServices(kubeClient, ks)
-	watchForNodes(kubeClient, ks)
-	glog.Info("Watchers running")
+	//Do System Setup stuff (create channels?)
+
+	//Launch KubeLoops
+	//Launch Consul Loops
+
+	//Launch Sync Loops (if needed)
+
+	// Prevent exit
 	select {}
 }

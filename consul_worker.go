@@ -1,5 +1,7 @@
-package kube2consul
+package main // import "github.com/jmccarty3/kube2consul"
 
+
+/*
 import(
   "strconv"
 	"strings"
@@ -139,3 +141,4 @@ func newConsulClient(consulAgent string) (*consulapi.Client, error) {
 
 	return client, nil
 }
+*/
