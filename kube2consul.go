@@ -28,10 +28,13 @@ import (
 	"time"
 	"github.com/golang/glog"
 
-	//"github.com/google/cadvisor/info/v1"
-	//"github.com/imdario/mergo"
+	kapi "k8s.io/kubernetes/pkg/api"
 	kclient "k8s.io/kubernetes/pkg/client/unversioned"
 	kclientcmd "k8s.io/kubernetes/pkg/client/unversioned/clientcmd"
+	kframework "k8s.io/kubernetes/pkg/controller/framework"
+	kcache "k8s.io/kubernetes/pkg/client/cache"
+	kSelector "k8s.io/kubernetes/pkg/fields"
+	"k8s.io/kubernetes/pkg/util"
 )
 
 
@@ -105,8 +108,6 @@ func createKubeClient() (*kclient.Client, error) {
 	overrides := &kclientcmd.ConfigOverrides{}
 	overrides.ClusterInfo.Server = masterUrl
 
-	glog.Info("Overrids server:", overrides.ClusterInfo.Server)
-
 	rules := kclientcmd.NewDefaultClientConfigLoadingRules()
 	kubeConfig, err := kclientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, overrides).ClientConfig()
 
@@ -118,6 +119,102 @@ func createKubeClient() (*kclient.Client, error) {
 	glog.Infof("Using %s for kubernetes master", kubeConfig.Host)
 	glog.Infof("Using kubernetes API %s", kubeConfig.Version)
 	return kclient.New(kubeConfig)
+}
+
+// Returns a cache.ListWatch that gets all changes to services.
+func createServiceLW(kubeClient *kclient.Client) *kcache.ListWatch {
+	return kcache.NewListWatchFromClient(kubeClient, "services", kapi.NamespaceAll, kSelector.Everything())
+}
+
+// Returns a cache.ListWatch that gets all changes to nodes.
+func createNodeLW(kubeClient *kclient.Client) *kcache.ListWatch {
+	return kcache.NewListWatchFromClient(kubeClient, "nodes", kapi.NamespaceAll, kSelector.Everything())
+}
+
+func nodeReady(node *kapi.Node) bool {
+	for  i := range node.Status.Conditions {
+		if node.Status.Conditions[i].Type == kapi.NodeReady {
+			return node.Status.Conditions[i].Status == kapi.ConditionTrue
+		}
+	}
+
+	glog.Error("NodeReady condition is missing from node: ", node.Name)
+	return false
+}
+
+//TODO Make Generic with Service
+func sendNodeWork(action KubeWorkAction, queue chan<- KubeWork, oldObject,newObject interface{}) {
+	if node, ok := newObject.(*kapi.Node); ok {
+		glog.Info("Node Action: ", action, " for node ", node.Name)
+		work := KubeWork {
+			Action: action,
+			Node: node,
+		}
+
+		if action == KubeWorkUpdateNode{
+			if oldNode, ok := oldObject.(*kapi.Node); ok {
+				if nodeReady(node) != nodeReady(oldNode) {
+					glog.Info("Ready state change. Old:", nodeReady(oldNode), " New: ", nodeReady(node))
+					queue <- work
+				}
+			}
+		} else {
+				queue <-work
+		}
+	}
+}
+
+//TODO Make Generic with Node
+func sendServiceWork(action KubeWorkAction, queue chan<- KubeWork, serviceObj interface{}) {
+	if service, ok := serviceObj.(*kapi.Service); ok {
+		glog.Info("Service Action: ", action, " for service ", service.Name)
+		queue <- KubeWork{
+			Action: action,
+			Service: service,
+		}
+	}
+}
+
+//TODO Combine with watchForServices
+func watchForNodes(kubeClient *kclient.Client, queue chan<- KubeWork) {
+	_, nodeController := kframework.NewInformer(
+		createNodeLW(kubeClient),
+		&kapi.Node{},
+		resyncPeriod,
+		kframework.ResourceEventHandlerFuncs{
+			AddFunc:    func(obj interface{}) {
+				sendNodeWork(KubeWorkAddNode, queue, nil, obj)
+			},
+			DeleteFunc: func(obj interface{}) {
+				sendNodeWork(KubeWorkRemoveNode, queue, nil, obj)
+			},
+			UpdateFunc: func(newObj,oldObj interface{}) {
+				sendNodeWork(KubeWorkUpdateNode, queue, oldObj, newObj)
+			},
+		},
+	)
+	go nodeController.Run(util.NeverStop)
+}
+
+//TODO Combine with watchForNodes
+func watchForServices(kubeClient *kclient.Client, queue chan<- KubeWork) {
+	_, nodeController := kframework.NewInformer(
+		createServiceLW(kubeClient),
+		&kapi.Service{},
+		resyncPeriod,
+		kframework.ResourceEventHandlerFuncs{
+			AddFunc:    func(obj interface{}) {
+				sendServiceWork(KubeWorkAddService, queue, obj)
+			},
+			DeleteFunc: func(obj interface{}) {
+				sendServiceWork(KubeWorkRemoveService, queue, obj)
+			},
+			UpdateFunc: func(newObj,oldObj interface{}) {
+				sendServiceWork(KubeWorkUpdateService, queue, newObj)
+			},
+		},
+	)
+	go nodeController.Run(util.NeverStop)
 }
 
 func main() {
@@ -137,8 +234,11 @@ func main() {
 	//Attempt to create Consul Client (All ways needed so that channels are not blocked)
 
 	//Do System Setup stuff (create channels?)
-
+	kubeWorkQueue := make(chan KubeWork)
+	go RunBookKeeper(kubeWorkQueue)
 	//Launch KubeLoops
+	watchForNodes(kubeClient, kubeWorkQueue)
+	watchForServices(kubeClient, kubeWorkQueue)
 	//Launch Consul Loops
 
 	//Launch Sync Loops (if needed)
