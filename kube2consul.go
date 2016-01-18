@@ -25,26 +25,21 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"reflect"
-	"strconv"
-	"strings"
 	"time"
-
 	"github.com/golang/glog"
+	"reflect"
+
 	consulapi "github.com/hashicorp/consul/api"
+
 	kapi "k8s.io/kubernetes/pkg/api"
-	kcache "k8s.io/kubernetes/pkg/client/cache"
 	kclient "k8s.io/kubernetes/pkg/client/unversioned"
 	kclientcmd "k8s.io/kubernetes/pkg/client/unversioned/clientcmd"
-	kcontrollerFramework "k8s.io/kubernetes/pkg/controller/framework"
 	kframework "k8s.io/kubernetes/pkg/controller/framework"
+	kcache "k8s.io/kubernetes/pkg/client/cache"
 	kSelector "k8s.io/kubernetes/pkg/fields"
 	"k8s.io/kubernetes/pkg/util"
-
-	//  "k8s.io/kubernetes/pkg/api"
-	//  "k8s.io/kubernetes/pkg/fields"
-	//  "k8s.io/kubernetes/pkg/labels"
 )
+
 
 var (
 	argConsulAgent   = flag.String("consul-agent", "http://127.0.0.1:8500", "URL to consul agent")
@@ -52,6 +47,8 @@ var (
 	argKubeMasterUrl = flag.String("kube_master_url", "https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}", "Url to reach kubernetes master. Env variables in this flag will be expanded.")
 	argDryRun        = flag.Bool("dryrun", false, "Runs without connecting to consul")
 	argChecks        = flag.Bool("checks", false, "Adds TCP service checks for each TCP Service")
+	argConsulSync    = flag.Int("consul-sync", 0, "Set >0 to run a consul sync loop. Useful for consul restarts")
+	argKubeSync    = flag.Int("kube-sync", 0, "Set >0 to run a kube sync loop. Useful for kube sanity checks if a notifcation is missed")
 )
 
 const (
@@ -60,46 +57,6 @@ const (
 	// Resync period for the kube controller loop.
 	resyncPeriod = 5 * time.Second
 )
-
-type nodeInformation struct {
-	name string
-
-	address string
-
-	ready bool
-	// map[service] DNS IDs
-	ids map[string][]string
-}
-
-type kube2consul struct {
-	// Consul client.
-	consulClient *consulapi.Client
-
-	// DNS domain name.
-	domain string
-
-	//Nodes Name / valid
-	nodes map[string]nodeInformation
-
-	//All Services.
-	services map[string]*kapi.Service
-}
-
-func Newkube2consul() *kube2consul {
-	var k kube2consul
-	k.nodes = make(map[string]nodeInformation)
-	k.services = make(map[string]*kapi.Service)
-
-	return &k
-}
-
-func NewnodeInformation() *nodeInformation {
-	var n nodeInformation
-	n.ready = false
-	n.ids = make(map[string][]string)
-
-	return &n
-}
 
 func Contains(s []string, e string) bool {
 	for _, i := range s {
@@ -110,82 +67,24 @@ func Contains(s []string, e string) bool {
 	return false
 }
 
-func (ks *kube2consul) removeDNS(recordID string) error {
-	glog.Infof("Removing %s from DNS", recordID)
-	if ks.consulClient != nil {
-		ks.consulClient.Agent().ServiceDeregister(recordID)
+func getKubeMasterUrl() (string, error) {
+	if *argKubeMasterUrl == "" {
+		return "", fmt.Errorf("no --kube_master_url specified")
 	}
-	return nil
+
+	parsedUrl, err := url.Parse(os.ExpandEnv(*argKubeMasterUrl))
+	if err != nil {
+		return "", fmt.Errorf("failed to parse --kube_master_url %s - %v", *argKubeMasterUrl, err)
+	}
+	if parsedUrl.Scheme == "" || parsedUrl.Host == "" || parsedUrl.Host == ":" {
+		return "", fmt.Errorf("invalid --kube_master_url specified %s", *argKubeMasterUrl)
+	}
+
+	glog.Info("Parsed Master URL:", parsedUrl.String())
+	return parsedUrl.String(), nil
 }
 
-func (ks *kube2consul) createDNS(record string, service *kapi.Service, node *nodeInformation) error {
-	glog.V(4).Info("Starting DNS creation for", service.Name)
-	if strings.Contains(record, ".") {
-		glog.Infof("Service names containing '.' are not supported: %s\n", service.Name)
-		return nil
-	}
-
-	// if ClusterIP is not set, do not create a DNS records
-	if !kapi.IsServiceIPSet(service) {
-		glog.Infof("Skipping dns record for headless service: %s\n", service.Name)
-		return nil
-	}
-
-	//Currently this is only for NodePorts.
-	if service.Spec.Type != kapi.ServiceTypeNodePort {
-		glog.V(3).Infof("Skipping non-NodePort service: %s\n", service.Name)
-		return nil
-	}
-
-	for i := range service.Spec.Ports {
-		newId := node.name + record + service.Spec.Ports[i].Name
-		var asrName string
-
-		//If the port has a name. Use that.
-		if len(service.Spec.Ports[i].Name) > 0 {
-			asrName = record + "-" + service.Spec.Ports[i].Name
-		} else if len(service.Spec.Ports) == 1 { //TODO: Pull out logic later
-			asrName = record
-		} else {
-			asrName = record + "-" + strconv.Itoa(service.Spec.Ports[i].Port)
-		}
-
-		if Contains(node.ids[record], newId) == false {
-			asr := &consulapi.AgentServiceRegistration{
-				ID:      newId,
-				Name:    asrName,
-				Address: node.address,
-				Port:    service.Spec.Ports[i].NodePort,
-				Tags:    []string{"Kube", string(service.Spec.Ports[i].Protocol) },
-			}
-
-			if *argChecks && service.Spec.Ports[i].Protocol == "TCP" {
-				target := string(node.address) + ":" + strconv.Itoa(service.Spec.Ports[i].NodePort)
-				glog.Infof("Created Service check for: %v on %v\n", asr.Name, target)
-				asr.Check = &consulapi.AgentServiceCheck {
-					TCP: target,
-					Interval: "60s",
-				}
-			}
-
-			glog.Infof("Setting DNS record: %v -> %v:%d with protocol %v\n", asr.Name, asr.Address, asr.Port, string(service.Spec.Ports[i].Protocol))
-
-			if ks.consulClient != nil {
-				if err := ks.consulClient.Agent().ServiceRegister(asr); err != nil {
-					glog.Errorf("Error registering with consul: %v\n", err)
-					return err
-				}
-			}
-
-			node.ids[record] = append(node.ids[record], newId)
-		}
-	}
-
-	glog.V(4).Info("Finished DNS creation for", service.Name)
-	return nil
-}
-
-func newConsulClient(consulAgent string) (*consulapi.Client, error) {
+func createConsulClient(consulAgent string) (*consulapi.Client, error) {
 	var (
 		client *consulapi.Client
 		err    error
@@ -233,50 +132,26 @@ func newConsulClient(consulAgent string) (*consulapi.Client, error) {
 	return client, nil
 }
 
-func getKubeMasterUrl() (string, error) {
-	if *argKubeMasterUrl == "" {
-		return "", fmt.Errorf("no --kube_master_url specified")
-	}
-	parsedUrl, err := url.Parse(os.ExpandEnv(*argKubeMasterUrl))
-	if err != nil {
-		return "", fmt.Errorf("failed to parse --kube_master_url %s - %v", *argKubeMasterUrl, err)
-	}
-	if parsedUrl.Scheme == "" || parsedUrl.Host == "" || parsedUrl.Host == ":" {
-		return "", fmt.Errorf("invalid --kube_master_url specified %s", *argKubeMasterUrl)
-	}
-	return parsedUrl.String(), nil
-}
-
-// TODO: evaluate using pkg/client/clientcmd
-func newKubeClient() (*kclient.Client, error) {
-	var config *kclient.Config
+func createKubeClient() (*kclient.Client, error) {
 	masterUrl, err := getKubeMasterUrl()
 	if err != nil {
 		return nil, err
 	}
-	if *argKubecfgFile == "" {
-		config = &kclient.Config{
-			Host:    masterUrl,
-			Version: "v1",
-		}
-	} else {
-		var err error
-		overrides := &kclientcmd.ConfigOverrides{}
-		overrides.ClusterInfo.Server = masterUrl                                     // might be "", but that is OK
-		rules := &kclientcmd.ClientConfigLoadingRules{ExplicitPath: *argKubecfgFile} // might be "", but that is OK
-		if config, err = kclientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, overrides).ClientConfig(); err != nil {
-			return nil, err
-		}
-	}
-	glog.Infof("Using %s for kubernetes master", config.Host)
-	glog.Infof("Using kubernetes API %s", config.Version)
-	return kclient.New(config)
-}
 
-func buildNameString(service, namespace string) string {
-	//glog.Infof("Name String: %s  %s", service, namespace)
-	//return fmt.Sprintf("%s.%s", service, namespace)
-	return fmt.Sprintf("%s", service)
+	overrides := &kclientcmd.ConfigOverrides{}
+	overrides.ClusterInfo.Server = masterUrl
+
+	rules := kclientcmd.NewDefaultClientConfigLoadingRules()
+	kubeConfig, err := kclientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, overrides).ClientConfig()
+
+	kubeConfig.Host = masterUrl
+	if err != nil {
+		glog.Error("Error creating Kube Config", err)
+		return nil, err
+	}
+	glog.Infof("Using %s for kubernetes master", kubeConfig.Host)
+	glog.Infof("Using kubernetes API %s", kubeConfig.Version)
+	return kclient.New(kubeConfig)
 }
 
 // Returns a cache.ListWatch that gets all changes to services.
@@ -284,57 +159,9 @@ func createServiceLW(kubeClient *kclient.Client) *kcache.ListWatch {
 	return kcache.NewListWatchFromClient(kubeClient, "services", kapi.NamespaceAll, kSelector.Everything())
 }
 
-// Returns a cache.ListWatch that gets all changes to services.
+// Returns a cache.ListWatch that gets all changes to nodes.
 func createNodeLW(kubeClient *kclient.Client) *kcache.ListWatch {
 	return kcache.NewListWatchFromClient(kubeClient, "nodes", kapi.NamespaceAll, kSelector.Everything())
-}
-
-func (ks *kube2consul) newService(obj interface{}) {
-	if s, ok := obj.(*kapi.Service); ok {
-		name := buildNameString(s.Name, s.Namespace)
-		ks.services[name] = s
-
-		glog.V(2).Info("Creating Service: ", name)
-		//Add to all existing nodes
-		for _, node := range ks.nodes {
-			if node.ready {
-				ks.createDNS(name, s, &node)
-			} else {
-				glog.V(4).Info("Skipping node ", node.name, " as not ready" )
-			}
-		}
-	}
-}
-
-func (ks *kube2consul) removeService(obj interface{}) {
-	if s, ok := obj.(*kapi.Service); ok {
-		name := buildNameString(s.Name, s.Namespace)
-		//Remove service from node
-		for _, node := range ks.nodes {
-			for _, id := range node.ids[name] {
-				ks.removeDNS(id)
-			}
-			delete(node.ids, name)
-		}
-		delete(ks.services, name)
-	}
-}
-
-func (ks *kube2consul) updateService(oldObj, newObj interface{}) {
-	if old, ok := oldObj.(*kapi.Service); ok {
-		if new, ok := newObj.(*kapi.Service); ok {
-			if reflect.DeepEqual(*old, *new) == false {
-				ks.removeService(old)
-				ks.newService(new)
-			}
-		}
-	}
-}
-
-func (ks *kube2consul) addNodeServices(nodeInfo *nodeInformation) {
-	for serviceName, service := range ks.services {
-		ks.createDNS(serviceName, service, nodeInfo)
-	}
 }
 
 func nodeReady(node *kapi.Node) bool {
@@ -348,121 +175,142 @@ func nodeReady(node *kapi.Node) bool {
 	return false
 }
 
-func (ks *kube2consul) updateNode(oldObj, newObj interface{}) {
-	if n, ok := newObj.(*kapi.Node); ok {
-		ready := nodeReady(n)
-		nodeInfo := ks.nodes[n.Name]
-
-		glog.V(4).Info("Update Node request: ", n.Name)
-
-		if nodeInfo.ready != ready {
-			glog.Infoln("Updating node:", n.Name, "with to ready status:", ready)
-			nodeInfo.ready = ready
-			if ready {
-				ks.addNodeServices(&nodeInfo)
-			} else {
-				for _, serviceIDs := range nodeInfo.ids {
-					for _, serviceID := range serviceIDs {
-						ks.removeDNS(serviceID)
-					}
-				}
-				nodeInfo.ids = make(map[string][]string) //Clear tha map
-			}
-
-			ks.nodes[n.Name] = nodeInfo
+//TODO Make Generic with Service
+func sendNodeWork(action KubeWorkAction, queue chan<- KubeWork, oldObject,newObject interface{}) {
+	if node, ok := newObject.(*kapi.Node); ok {
+		glog.V(4).Info("Node Action: ", action, " for node ", node.Name)
+		work := KubeWork {
+			Action: action,
+			Node: node,
 		}
-	}
-}
 
-func (ks *kube2consul) newNode(newObj interface{}) {
-	if node, ok := newObj.(*kapi.Node); ok {
-		if _, ok := ks.nodes[node.Name]; !ok {
-			var newNode = *NewnodeInformation()
-			newNode.name = node.Name
-			newNode.address = node.Status.Addresses[0].Address
-			newNode.ready = nodeReady(node)
-
-			glog.Info("Adding Node: ", node.Name, " Ready State:", newNode.ready, "  Stored:", node.Status.Conditions[0].Status)
-			ks.nodes[node.Name] = newNode
-
-			if newNode.ready {
-				ks.addNodeServices(&newNode)
-			}
-		}
-	}
-}
-
-func (ks *kube2consul) removeNode(oldObj interface{}) {
-	if node, ok := oldObj.(*kapi.Node); ok {
-		if info, ok := ks.nodes[node.Name]; ok {
-			glog.Info("Removing Node: ", node.Name)
-			for _, idSet := range info.ids {
-				for _, id := range idSet {
-					ks.removeDNS(id)
+		if action == KubeWorkUpdateNode{
+			if oldNode, ok := oldObject.(*kapi.Node); ok {
+				if nodeReady(node) != nodeReady(oldNode) {
+					glog.V(4).Info("Ready state change. Old:", nodeReady(oldNode), " New: ", nodeReady(node))
+					queue <- work
 				}
 			}
-
-			delete(ks.nodes, node.Name)
-		}	else {
-			glog.Infoln("Attempted to remove node ", node.Name, " not in inventory")
+		} else {
+				queue <-work
 		}
 	}
 }
 
-func watchForServices(kubeClient *kclient.Client, ks *kube2consul) {
-	var serviceController *kcontrollerFramework.Controller
-	_, serviceController = kframework.NewInformer(
-		createServiceLW(kubeClient),
-		&kapi.Service{},
-		resyncPeriod,
-		kframework.ResourceEventHandlerFuncs{
-			AddFunc:    ks.newService,
-			DeleteFunc: ks.removeService,
-			UpdateFunc: ks.updateService,
-		},
-	)
-	go serviceController.Run(util.NeverStop)
+//TODO Make Generic with Node
+func sendServiceWork(action KubeWorkAction, queue chan<- KubeWork, serviceObj interface{}) {
+	if service, ok := serviceObj.(*kapi.Service); ok {
+		glog.V(4).Info("Service Action: ", action, " for service ", service.Name)
+		queue <- KubeWork{
+			Action: action,
+			Service: service,
+		}
+	}
 }
 
-func watchForNodes(kubeClient *kclient.Client, ks *kube2consul) kcache.Store {
-	store, serviceController := kframework.NewInformer(
+//TODO Combine with watchForServices
+func watchForNodes(kubeClient *kclient.Client, queue chan<- KubeWork) {
+	_, nodeController := kframework.NewInformer(
 		createNodeLW(kubeClient),
 		&kapi.Node{},
 		resyncPeriod,
 		kframework.ResourceEventHandlerFuncs{
-			AddFunc:    ks.newNode,
-			DeleteFunc: ks.removeNode,
-			UpdateFunc: ks.updateNode,
+			AddFunc:    func(obj interface{}) {
+				sendNodeWork(KubeWorkAddNode, queue, nil, obj)
+			},
+			DeleteFunc: func(obj interface{}) {
+				sendNodeWork(KubeWorkRemoveNode, queue, nil, obj)
+			},
+			UpdateFunc: func(newObj,oldObj interface{}) {
+				sendNodeWork(KubeWorkUpdateNode, queue, oldObj, newObj)
+			},
 		},
 	)
-	glog.Info("About to call run!")
-	go serviceController.Run(util.NeverStop)
-	return store
+	go nodeController.Run(util.NeverStop)
+}
+
+//TODO Combine with watchForNodes
+func watchForServices(kubeClient *kclient.Client, queue chan<- KubeWork) {
+	_, nodeController := kframework.NewInformer(
+		createServiceLW(kubeClient),
+		&kapi.Service{},
+		resyncPeriod,
+		kframework.ResourceEventHandlerFuncs{
+			AddFunc:    func(obj interface{}) {
+				sendServiceWork(KubeWorkAddService, queue, obj)
+			},
+			DeleteFunc: func(obj interface{}) {
+				sendServiceWork(KubeWorkRemoveService, queue, obj)
+			},
+			UpdateFunc: func(newObj,oldObj interface{}) {
+				if reflect.DeepEqual(newObj,oldObj) == false {
+					sendServiceWork(KubeWorkUpdateService, queue, newObj)
+				}
+			},
+		},
+	)
+	go nodeController.Run(util.NeverStop)
 }
 
 func main() {
 	flag.Parse()
-	var err error
-	// TODO: Validate input flags.
-	ks := Newkube2consul()
 
-	if *argDryRun {
-		glog.Info("Dryrun started. Ignoring Consul")
-	} else {
-		if ks.consulClient, err = newConsulClient(*argConsulAgent); err != nil {
-			glog.Fatalf("Failed to create Consul client - %v", err)
-		}
-	}
-
-	kubeClient, err := newKubeClient()
+	//Attempt to create Kube Client
+	kubeClient, err := createKubeClient()
 	if err != nil {
-		glog.Fatalf("Failed to create a kubernetes client: %v", err)
+		glog.Fatal("Could not connect to Kube Master", err)
 	}
 
-	glog.Info(kubeClient.ServerVersion())
+	if _, err := kubeClient.ServerVersion(); err != nil {
+		glog.Fatal("Could not connect to Kube Master", err)
+	} else {
+		glog.Info("Connected to K8S API Server")
+	}
+	//Attempt to create Consul Client (All ways needed so that channels are not blocked)
+	var consulClient *consulapi.Client
+	if *argDryRun == false {
+		consulClient, err = createConsulClient(*argConsulAgent)
+	}
 
-	watchForServices(kubeClient, ks)
-	watchForNodes(kubeClient, ks)
-	glog.Info("Watchers running")
+	//Do System Setup stuff (create channels?)
+	kubeWorkQueue := make(chan KubeWork)
+	consulWorkQueue := make(chan ConsulWork)
+	go RunBookKeeper(kubeWorkQueue, consulWorkQueue, kubeClient)
+	//Launch KubeLoops
+	watchForNodes(kubeClient, kubeWorkQueue)
+	watchForServices(kubeClient, kubeWorkQueue)
+	//Launch Consul Loops
+	go RunConsulWorker(consulWorkQueue, consulClient)
+
+	//Launch Sync Loops (if needed)
+	if *argConsulSync > 0 {
+		glog.Info("Running Consul Sync loop every: ", *argConsulSync, " seconds")
+		syncer := time.NewTicker(time.Second * time.Duration(*argConsulSync))
+
+	  go func() {
+	    for t := range syncer.C {
+	      glog.V(4).Info("Consul Sync request at:", t)
+	      consulWorkQueue <- ConsulWork {
+					Action: ConsulWorkSyncDNS,
+				}
+	    }
+	  }()
+	}
+
+	if *argKubeSync > 0 {
+		glog.Info("Running Kube Sync loop every: ", *argConsulSync, " seconds")
+		syncer := time.NewTicker(time.Second * time.Duration(*argKubeSync))
+
+	  go func() {
+	    for t := range syncer.C {
+	      glog.V(4).Info("Kube Sync request at:", t)
+	      kubeWorkQueue <- KubeWork {
+					Action: KubeWorkSync,
+				}
+	    }
+	  }()
+	}
+
+	// Prevent exit
 	select {}
 }
