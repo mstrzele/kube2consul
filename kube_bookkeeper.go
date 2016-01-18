@@ -4,6 +4,9 @@ import (
   "github.com/golang/glog"
   //"k8s.io/kubernetes/pkg/api"
   kapi "k8s.io/kubernetes/pkg/api"
+  kclient "k8s.io/kubernetes/pkg/client/unversioned"
+  kfields "k8s.io/kubernetes/pkg/fields"
+	klabels "k8s.io/kubernetes/pkg/labels"
 )
 
 //TODO: Chang to store Node pointer. Add getName, getReadyStatus accessors
@@ -11,6 +14,7 @@ type KubeNode struct {
   name string
   readyStatus bool;
   serviceIDS map[string]string;
+  address string
 }
 
 type KubeBookKeeper interface {
@@ -25,8 +29,10 @@ type KubeBookKeeper interface {
 
 type ClientBookKeeper struct {
   KubeBookKeeper
+  client *kclient.Client
   nodes map[string]*KubeNode;
   services map[string]*kapi.Service
+  consulQueue chan<- ConsulWork
 }
 
 func BuildServiceBaseID(nodeName string, service *kapi.Service) string {
@@ -41,16 +47,18 @@ func NewKubeNode() *KubeNode {
   }
 }
 
-func NewClientBookKeeper() *ClientBookKeeper {
+func NewClientBookKeeper(client *kclient.Client) *ClientBookKeeper {
   return &ClientBookKeeper {
+    client: client,
     nodes: make(map[string]*KubeNode),
     services: make(map[string]*kapi.Service),
   }
 }
 
-func RunBookKeeper(workQue <-chan KubeWork) {
+func RunBookKeeper(workQue <-chan KubeWork, consulQueue chan<- ConsulWork, apiClient *kclient.Client) {
 
-  client := NewClientBookKeeper()
+  client := NewClientBookKeeper(apiClient)
+  client.consulQueue = consulQueue
 
   for work := range workQue {
     switch work.Action {
@@ -64,6 +72,8 @@ func RunBookKeeper(workQue <-chan KubeWork) {
       client.RemoveService(work.Service)
     case KubeWorkUpdateService:
       client.UpdateService(work.Service)
+    case KubeWorkSync:
+      client.Sync()
     default:
       glog.Info("Unsupported work action: ", work.Action)
     }
@@ -74,7 +84,14 @@ func RunBookKeeper(workQue <-chan KubeWork) {
 
 func (client *ClientBookKeeper) AttachServiceToNode(node *KubeNode, service *kapi.Service) {
   baseID := BuildServiceBaseID(node.name, service)
-  //To Consol -> TODO
+  client.consulQueue <- ConsulWork {
+    Action: ConsulWorkAddDNS,
+    Service: service,
+    Config: DnsInfo {
+      BaseID: baseID,
+      IPAddress: node.address,
+      },
+  }
   glog.V(3).Info("Requesting Addition of services with Base ID: ", baseID)
   node.serviceIDS[service.Name] = baseID
 }
@@ -82,6 +99,13 @@ func (client *ClientBookKeeper) AttachServiceToNode(node *KubeNode, service *kap
 func (client *ClientBookKeeper) DetachServiceFromNode(node *KubeNode, service *kapi.Service) {
   if baseID,ok := node.serviceIDS[service.Name]; ok {
     //To Consol -> TODO
+    client.consulQueue <- ConsulWork {
+      Action: ConsulWorkRemoveDNS,
+      Config: DnsInfo {
+        BaseID: baseID,
+      },
+    }
+
     glog.V(3).Info("Requesting Removal of services with Base ID: ", baseID)
     delete(node.serviceIDS, service.Name)
   }
@@ -108,6 +132,8 @@ func (client *ClientBookKeeper) AddNode(newNode *kapi.Node) {
   //Add to Node Collection
   createdNode := NewKubeNode()
   createdNode.readyStatus = nodeReady(newNode)
+  createdNode.name = newNode.Name
+  createdNode.address = newNode.Status.Addresses[0].Address
 
   //Send request for Service Addition for node and all serviceIDS (Create Service ID here)
   if createdNode.readyStatus {
@@ -134,14 +160,31 @@ func (client *ClientBookKeeper) UpdateNode(updatedNode *kapi.Node) {
   //TODO Check it exists
   if nodeReady(updatedNode) {
     client.AddAllServicesToNode(client.nodes[updatedNode.Name])
+  } else {
+    client.RemoveAllServicesFromNode(client.nodes[updatedNode.Name])
   }
   //Else -> Service Removal for Node
   //UnLock
 }
 
-func SyncNodes() {
-  //Get All Nodes from API
-  //Lock Access
+func ContainsNodeName(name string, nodes *kapi.NodeList) bool {
+  for _,node := range nodes.Items {
+    if node.ObjectMeta.Name == name {
+      return true
+    }
+  }
+  return false
+}
+
+func (client *ClientBookKeeper) Sync() {
+  nodes := client.client.Nodes()
+  if nodeList, err := nodes.List(klabels.Everything(), kfields.Everything()); err == nil {
+    for name,_ := range client.nodes {
+      if !ContainsNodeName(name, nodeList) {
+          glog.Errorf("Bookkeeper has node: %s that does not exist in api server", name)
+      }
+    }
+  }
   //Add Remove as needed
   //UnLock
 }

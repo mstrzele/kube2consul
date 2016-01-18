@@ -27,6 +27,9 @@ import (
 	"os"
 	"time"
 	"github.com/golang/glog"
+	"reflect"
+
+	consulapi "github.com/hashicorp/consul/api"
 
 	kapi "k8s.io/kubernetes/pkg/api"
 	kclient "k8s.io/kubernetes/pkg/client/unversioned"
@@ -44,6 +47,8 @@ var (
 	argKubeMasterUrl = flag.String("kube_master_url", "https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}", "Url to reach kubernetes master. Env variables in this flag will be expanded.")
 	argDryRun        = flag.Bool("dryrun", false, "Runs without connecting to consul")
 	argChecks        = flag.Bool("checks", false, "Adds TCP service checks for each TCP Service")
+	argConsulSync    = flag.Int("consul-sync", 0, "Set >0 to run a consul sync loop. Useful for consul restarts")
+	argKubeSync    = flag.Int("kube-sync", 0, "Set >0 to run a kube sync loop. Useful for kube sanity checks if a notifcation is missed")
 )
 
 const (
@@ -52,17 +57,6 @@ const (
 	// Resync period for the kube controller loop.
 	resyncPeriod = 5 * time.Second
 )
-
-
-/*
-func Newkube2consul() *kube2consul {
-	var k kube2consul
-	k.nodes = make(map[string]nodeInformation)
-	k.services = make(map[string]*kapi.Service)
-
-	return &k
-}
-*/
 
 func Contains(s []string, e string) bool {
 	for _, i := range s {
@@ -90,14 +84,53 @@ func getKubeMasterUrl() (string, error) {
 	return parsedUrl.String(), nil
 }
 
-//Take Service Object and Node
-/*
-func buildNameString(service *Service) string {
-	//glog.Infof("Name String: %s  %s", service, namespace)
-	//return fmt.Sprintf("%s.%s", service, namespace)
-	return fmt.Sprintf("%s", service)
+func createConsulClient(consulAgent string) (*consulapi.Client, error) {
+	var (
+		client *consulapi.Client
+		err    error
+	)
+
+	consulConfig := consulapi.DefaultConfig()
+	consulAgentUrl, err := url.Parse(consulAgent)
+	if err != nil {
+		glog.Infof("Error parsing Consul url")
+		return nil, err
+	}
+
+	if consulAgentUrl.Host != "" {
+		consulConfig.Address = consulAgentUrl.Host
+	}
+
+	if consulAgentUrl.Scheme != "" {
+		consulConfig.Scheme = consulAgentUrl.Scheme
+	}
+
+	client, err = consulapi.NewClient(consulConfig)
+	if err != nil {
+		glog.Infof("Error creating Consul client")
+		return nil, err
+	}
+
+	for attempt := 1; attempt <= maxConnectAttempts; attempt++ {
+		if _, err = client.Agent().Self(); err == nil {
+			break
+		}
+
+		if attempt == maxConnectAttempts {
+			break
+		}
+
+		glog.Infof("[Attempt: %d] Attempting access to Consul after 5 second sleep", attempt)
+		time.Sleep(5 * time.Second)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to Consul agent: %v, error: %v", consulAgent, err)
+	}
+	glog.Infof("Consul agent found: %v", consulAgent)
+
+	return client, nil
 }
-*/
 
 func createKubeClient() (*kclient.Client, error) {
 	masterUrl, err := getKubeMasterUrl()
@@ -145,7 +178,7 @@ func nodeReady(node *kapi.Node) bool {
 //TODO Make Generic with Service
 func sendNodeWork(action KubeWorkAction, queue chan<- KubeWork, oldObject,newObject interface{}) {
 	if node, ok := newObject.(*kapi.Node); ok {
-		glog.Info("Node Action: ", action, " for node ", node.Name)
+		glog.V(4).Info("Node Action: ", action, " for node ", node.Name)
 		work := KubeWork {
 			Action: action,
 			Node: node,
@@ -154,7 +187,7 @@ func sendNodeWork(action KubeWorkAction, queue chan<- KubeWork, oldObject,newObj
 		if action == KubeWorkUpdateNode{
 			if oldNode, ok := oldObject.(*kapi.Node); ok {
 				if nodeReady(node) != nodeReady(oldNode) {
-					glog.Info("Ready state change. Old:", nodeReady(oldNode), " New: ", nodeReady(node))
+					glog.V(4).Info("Ready state change. Old:", nodeReady(oldNode), " New: ", nodeReady(node))
 					queue <- work
 				}
 			}
@@ -167,7 +200,7 @@ func sendNodeWork(action KubeWorkAction, queue chan<- KubeWork, oldObject,newObj
 //TODO Make Generic with Node
 func sendServiceWork(action KubeWorkAction, queue chan<- KubeWork, serviceObj interface{}) {
 	if service, ok := serviceObj.(*kapi.Service); ok {
-		glog.Info("Service Action: ", action, " for service ", service.Name)
+		glog.V(4).Info("Service Action: ", action, " for service ", service.Name)
 		queue <- KubeWork{
 			Action: action,
 			Service: service,
@@ -210,7 +243,9 @@ func watchForServices(kubeClient *kclient.Client, queue chan<- KubeWork) {
 				sendServiceWork(KubeWorkRemoveService, queue, obj)
 			},
 			UpdateFunc: func(newObj,oldObj interface{}) {
-				sendServiceWork(KubeWorkUpdateService, queue, newObj)
+				if reflect.DeepEqual(newObj,oldObj) == false {
+					sendServiceWork(KubeWorkUpdateService, queue, newObj)
+				}
 			},
 		},
 	)
@@ -232,16 +267,49 @@ func main() {
 		glog.Info("Connected to K8S API Server")
 	}
 	//Attempt to create Consul Client (All ways needed so that channels are not blocked)
+	var consulClient *consulapi.Client
+	if *argDryRun == false {
+		consulClient, err = createConsulClient(*argConsulAgent)
+	}
 
 	//Do System Setup stuff (create channels?)
 	kubeWorkQueue := make(chan KubeWork)
-	go RunBookKeeper(kubeWorkQueue)
+	consulWorkQueue := make(chan ConsulWork)
+	go RunBookKeeper(kubeWorkQueue, consulWorkQueue, kubeClient)
 	//Launch KubeLoops
 	watchForNodes(kubeClient, kubeWorkQueue)
 	watchForServices(kubeClient, kubeWorkQueue)
 	//Launch Consul Loops
+	go RunConsulWorker(consulWorkQueue, consulClient)
 
 	//Launch Sync Loops (if needed)
+	if *argConsulSync > 0 {
+		glog.Info("Running Consul Sync loop every: ", *argConsulSync, " seconds")
+		syncer := time.NewTicker(time.Second * time.Duration(*argConsulSync))
+
+	  go func() {
+	    for t := range syncer.C {
+	      glog.V(4).Info("Consul Sync request at:", t)
+	      consulWorkQueue <- ConsulWork {
+					Action: ConsulWorkSyncDNS,
+				}
+	    }
+	  }()
+	}
+
+	if *argKubeSync > 0 {
+		glog.Info("Running Kube Sync loop every: ", *argConsulSync, " seconds")
+		syncer := time.NewTicker(time.Second * time.Duration(*argKubeSync))
+
+	  go func() {
+	    for t := range syncer.C {
+	      glog.V(4).Info("Kube Sync request at:", t)
+	      kubeWorkQueue <- KubeWork {
+					Action: KubeWorkSync,
+				}
+	    }
+	  }()
+	}
 
 	// Prevent exit
 	select {}

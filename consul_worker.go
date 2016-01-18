@@ -1,144 +1,188 @@
 package main // import "github.com/jmccarty3/kube2consul"
 
-
-/*
-import(
-  "strconv"
-	"strings"
-
+import (
   "github.com/golang/glog"
-	consulapi "github.com/hashicorp/consul/api"
-	kapi "k8s.io/kubernetes/pkg/api"
+  "strings"
+  "strconv"
+
+  consulapi "github.com/hashicorp/consul/api"
+  kapi "k8s.io/kubernetes/pkg/api"
 )
 
 type ConsulWorker interface {
-  AddDNS()()
-  RemoveDNS()()
-  GetServices()()
+  AddDNS(baseID string, service *kapi.Service)
+  RemoveDNS(baseID string)
+  SyncDNS()
 }
 
-type ConsulClient struct {
+type ConsulAgentWorker struct {
   ConsulWorker
+
+  ids map[string][]*consulapi.AgentServiceRegistration
+  agent *consulapi.Client
 }
 
+func IsServiceNameValid(name string) bool {
+  if strings.Contains(name, ".") == false {
+    return true
+  }
 
-func (ks *kube2consul) createDNS(record string, service *kapi.Service, node *nodeInformation) error {
-	if strings.Contains(record, ".") {
-		glog.Infof("Service names containing '.' are not supported: %s\n", service.Name)
-		return nil
-	}
-
-	// if ClusterIP is not set, do not create a DNS records
-	if !kapi.IsServiceIPSet(service) {
-		glog.Infof("Skipping dns record for headless service: %s\n", service.Name)
-		return nil
-	}
-
-	//Currently this is only for NodePorts.
-	if service.Spec.Type != kapi.ServiceTypeNodePort {
-		glog.V(3).Infof("Skipping non-NodePort service: %s\n", service.Name)
-		return nil
-	}
-
-	for i := range service.Spec.Ports {
-		newId := node.name + record + service.Spec.Ports[i].Name
-		var asrName string
-
-		//If the port has a name. Use that.
-		if len(service.Spec.Ports[i].Name) > 0 {
-			asrName = record + "-" + service.Spec.Ports[i].Name
-		} else if len(service.Spec.Ports) == 1 { //TODO: Pull out logic later
-			asrName = record
-		} else {
-			asrName = record + "-" + strconv.Itoa(service.Spec.Ports[i].Port)
-		}
-
-		if Contains(node.ids[record], newId) == false {
-			asr := &consulapi.AgentServiceRegistration{
-				ID:      newId,
-				Name:    asrName,
-				Address: node.address,
-				Port:    service.Spec.Ports[i].NodePort,
-				Tags:    []string{"Kube", string(service.Spec.Ports[i].Protocol) },
-			}
-
-			if *argChecks && service.Spec.Ports[i].Protocol == "TCP" {
-				target := string(node.address) + ":" + strconv.Itoa(service.Spec.Ports[i].NodePort)
-				glog.Infof("Created Service check for: %v on %v\n", asr.Name, target)
-				asr.Check = &consulapi.AgentServiceCheck {
-					TCP: target,
-					Interval: "60s",
-				}
-			}
-
-			glog.Infof("Setting DNS record: %v -> %v:%d with protocol %v\n", asr.Name, asr.Address, asr.Port, string(service.Spec.Ports[i].Protocol))
-
-			if ks.consulClient != nil {
-				if err := ks.consulClient.Agent().ServiceRegister(asr); err != nil {
-					glog.Errorf("Error registering with consul: %v\n", err)
-					return err
-				}
-			}
-
-			node.ids[record] = append(node.ids[record], newId)
-		}
-	}
-	return nil
+  glog.Infof("Names containing '.' are not supported: %s\n", name)
+  return false
 }
 
-func (ks *kube2consul) removeDNS(recordID string) error {
-	glog.Infof("Removing %s from DNS", recordID)
-	if ks.consulClient != nil {
-		ks.consulClient.Agent().ServiceDeregister(recordID)
-	}
-	return nil
+func IsServiceValid(service *kapi.Service) bool {
+  if  IsServiceNameValid(service.Name) {
+    if kapi.IsServiceIPSet(service) {
+      if service.Spec.Type == kapi.ServiceTypeNodePort {
+        return true // Service is valid
+      } else {
+          //Currently this is only for NodePorts.
+          glog.V(3).Infof("Skipping non-NodePort service: %s\n", service.Name)
+      }
+    } else {
+        // if ClusterIP is not set, do not create a DNS records
+        glog.Infof("Skipping dns record for headless service: %s\n", service.Name)
+    }
+  }
+
+  return false
 }
 
-func newConsulClient(consulAgent string) (*consulapi.Client, error) {
-	var (
-		client *consulapi.Client
-		err    error
-	)
-
-	consulConfig := consulapi.DefaultConfig()
-	consulAgentUrl, err := url.Parse(consulAgent)
-	if err != nil {
-		glog.Infof("Error parsing Consul url")
-		return nil, err
-	}
-
-	if consulAgentUrl.Host != "" {
-		consulConfig.Address = consulAgentUrl.Host
-	}
-
-	if consulAgentUrl.Scheme != "" {
-		consulConfig.Scheme = consulAgentUrl.Scheme
-	}
-
-	client, err = consulapi.NewClient(consulConfig)
-	if err != nil {
-		glog.Infof("Error creating Consul client")
-		return nil, err
-	}
-
-	for attempt := 1; attempt <= maxConnectAttempts; attempt++ {
-		if _, err = client.Agent().Self(); err == nil {
-			break
-		}
-
-		if attempt == maxConnectAttempts {
-			break
-		}
-
-		glog.Infof("[Attempt: %d] Attempting access to Consul after 5 second sleep", attempt)
-		time.Sleep(5 * time.Second)
-	}
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to Consul agent: %v, error: %v", consulAgent, err)
-	}
-	glog.Infof("Consul agent found: %v", consulAgent)
-
-	return client, nil
+func CreateAgentServiceCheck(config DnsInfo, port *kapi.ServicePort) *consulapi.AgentServiceCheck {
+  glog.V(3).Info("Creating service check for: ", config.IPAddress, " on Port: ", port.NodePort)
+  return &consulapi.AgentServiceCheck {
+    TCP: config.IPAddress + ":" + strconv.Itoa(port.NodePort),
+    Interval: "60s",
+  }
 }
-*/
+
+func CreateAgentServiceReg(config DnsInfo,name string, service *kapi.Service, port *kapi.ServicePort) *consulapi.AgentServiceRegistration {
+  labels := []string{ "Kube", string(port.Protocol)}
+  asrID := config.BaseID + port.Name
+
+  if name == "" {
+    if len(port.Name) > 0 {
+      name = service.Name + "-" + port.Name
+    } else {
+      name = service.Name + "-" + strconv.Itoa(port.Port)
+    }
+  }
+
+  return &consulapi.AgentServiceRegistration{
+    ID: asrID,
+    Name: name,
+    Address: config.IPAddress,
+    Port: port.NodePort,
+    Tags: labels,
+  }
+}
+
+func NewConsulAgentWorker(client *consulapi.Client) *ConsulAgentWorker {
+  return &ConsulAgentWorker {
+    agent: client,
+    ids: make(map[string][]*consulapi.AgentServiceRegistration),
+  }
+}
+
+func (client *ConsulAgentWorker) AddDNS(config DnsInfo, service *kapi.Service) {
+  glog.V(3).Info("Starting Add DNS for: ", config.BaseID)
+
+  if config.IPAddress == "" || config.BaseID == "" {
+    glog.Error("DNS Info is not valid for AddDNS")
+  }
+
+  //Validate Service
+  if !IsServiceValid(service) {
+    return
+  }
+  //Check Port Count & Determine DNS Entry Name
+  var serviceName string
+
+  if len(service.Spec.Ports) == 1 {
+    serviceName = service.Name
+  } else {
+    serviceName = ""
+  }
+
+  for _,port := range service.Spec.Ports {
+    asr := CreateAgentServiceReg(config, serviceName, service, &port)
+
+    if *argChecks && port.Protocol == "TCP" {
+      //Create Check if neeeded
+      asr.Check = CreateAgentServiceCheck(config, &port)
+    }
+
+    if client.agent != nil {
+      //Registers with DNS
+      if err := client.agent.Agent().ServiceRegister(asr); err != nil {
+        glog.Error("Error creating service record: ", asr.ID)
+      }
+    }
+
+    //Add to IDS
+    client.ids[config.BaseID] = append(client.ids[config.BaseID], asr)
+  }
+
+  //Exit
+}
+
+func (client *ConsulAgentWorker) RemoveDNS(config DnsInfo) {
+  if ids, ok := client.ids[config.BaseID]; ok {
+    for _,asr := range ids {
+      if (client.agent != nil) {
+        client.agent.Agent().ServiceDeregister(asr.ID)
+      }
+    }
+    delete(client.ids, config.BaseID)
+  } else {
+    glog.Error("Requested to remove non-existant BaseID DNS of:", config.BaseID)
+  }
+}
+
+func ContainsServiceId(id string, services map[string]*consulapi.AgentService) bool {
+  for _, service := range services {
+    if service.ID == id {
+      return true
+    }
+  }
+
+  return false
+}
+
+func (client *ConsulAgentWorker) SyncDNS() {
+  if client.agent != nil {
+    if services, err := client.agent.Agent().Services(); err == nil {
+      for _,registered := range client.ids {
+        for _,service := range registered {
+          if !ContainsServiceId(service.ID, services) {
+            glog.Info("Regregistering missing service ID: ", service.ID)
+            client.agent.Agent().ServiceRegister(service)
+          }
+        }
+      }
+    } else {
+      glog.Info("Error retreiving services from consul during sync: ", err)
+    }
+  }
+}
+
+func RunConsulWorker(queue <-chan ConsulWork, client *consulapi.Client) {
+  worker := NewConsulAgentWorker(client)
+
+  for work := range queue {
+    glog.V(4).Info("Consol Work Action: ", work.Action, " BaseID:", work.Config.BaseID)
+
+    switch work.Action {
+    case ConsulWorkAddDNS:
+      worker.AddDNS(work.Config, work.Service)
+    case ConsulWorkRemoveDNS:
+      worker.RemoveDNS(work.Config)
+    case ConsulWorkSyncDNS:
+      worker.SyncDNS()
+    default:
+      glog.Error("Unsupported Action of: ", work.Action)
+    }
+
+  }
+}
