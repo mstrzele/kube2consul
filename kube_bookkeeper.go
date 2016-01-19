@@ -65,7 +65,7 @@ func RunBookKeeper(workQue <-chan KubeWork, consulQueue chan<- ConsulWork, apiCl
     case KubeWorkAddNode:
       client.AddNode(work.Node)
     case KubeWorkRemoveNode:
-      client.RemoveNode(work.Node)
+      client.RemoveNode(work.Node.Name)
     case KubeWorkAddService:
       client.AddService(work.Service)
     case KubeWorkRemoveService:
@@ -143,14 +143,14 @@ func (client *ClientBookKeeper) AddNode(newNode *kapi.Node) {
   glog.Info("Added Node: ", newNode.Name)
 }
 
-func (client *ClientBookKeeper) RemoveNode(oldNode *kapi.Node) {
-  if node,ok := client.nodes[oldNode.Name]; ok {
+func (client *ClientBookKeeper) RemoveNode(oldNodeName string) {
+  if node,ok := client.nodes[oldNodeName]; ok {
     //Remove All DNS for node
     client.RemoveAllServicesFromNode(node)
     //Remove Node from Collection
-    delete(client.nodes, oldNode.Name)
+    delete(client.nodes, oldNodeName)
   } else {
-    glog.Error("Attmepted to remove missing node: ", oldNode.Name)
+    glog.Error("Attmepted to remove missing node: ", oldNodeName)
   }
 
 }
@@ -182,6 +182,7 @@ func (client *ClientBookKeeper) Sync() {
     for name,_ := range client.nodes {
       if !ContainsNodeName(name, nodeList) {
           glog.Errorf("Bookkeeper has node: %s that does not exist in api server", name)
+          client.RemoveNode(name)
       }
     }
   }
