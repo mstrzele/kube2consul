@@ -1,0 +1,13 @@
+package: github.com/jmccarty3/kube2consul
+import:
+  - package: github.com/hashicorp/consul/api
+  - package: github.com/docker/docker
+    version: 1.9.0
+    subpackage:
+      - ...
+  - package: github.com/docker/libcontainer
+  - package: k8s.io/kubernetes
+    version: 1.1.7
+    subpackage:
+      - pkg/client/unversioned
+      - pkg/api
