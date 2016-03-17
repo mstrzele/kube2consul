@@ -25,21 +25,22 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"time"
-	"github.com/golang/glog"
 	"reflect"
+	"time"
+
+	"github.com/golang/glog"
 
 	consulapi "github.com/hashicorp/consul/api"
 
 	kapi "k8s.io/kubernetes/pkg/api"
+	kcache "k8s.io/kubernetes/pkg/client/cache"
 	kclient "k8s.io/kubernetes/pkg/client/unversioned"
 	kclientcmd "k8s.io/kubernetes/pkg/client/unversioned/clientcmd"
 	kframework "k8s.io/kubernetes/pkg/controller/framework"
-	kcache "k8s.io/kubernetes/pkg/client/cache"
 	kSelector "k8s.io/kubernetes/pkg/fields"
+	"k8s.io/kubernetes/pkg/labels"
 	"k8s.io/kubernetes/pkg/util"
 )
-
 
 var (
 	argConsulAgent   = flag.String("consul-agent", "http://127.0.0.1:8500", "URL to consul agent")
@@ -48,7 +49,10 @@ var (
 	argDryRun        = flag.Bool("dryrun", false, "Runs without connecting to consul")
 	argChecks        = flag.Bool("checks", false, "Adds TCP service checks for each TCP Service")
 	argConsulSync    = flag.Int("consul-sync", 0, "Set >0 to run a consul sync loop. Useful for consul restarts")
-	argKubeSync    = flag.Int("kube-sync", 0, "Set >0 to run a kube sync loop. Useful for kube sanity checks if a notifcation is missed")
+	argKubeSync      = flag.Int("kube-sync", 0, "Set >0 to run a kube sync loop. Useful for kube sanity checks if a notifcation is missed")
+	argNodeSelector  = flag.String("node-selector", "", "Node label selector to use for proxies. Leave blank for all")
+
+	nodeSelector = labels.Everything()
 )
 
 const (
@@ -165,7 +169,7 @@ func createNodeLW(kubeClient *kclient.Client) *kcache.ListWatch {
 }
 
 func nodeReady(node *kapi.Node) bool {
-	for  i := range node.Status.Conditions {
+	for i := range node.Status.Conditions {
 		if node.Status.Conditions[i].Type == kapi.NodeReady {
 			return node.Status.Conditions[i].Status == kapi.ConditionTrue
 		}
@@ -176,15 +180,20 @@ func nodeReady(node *kapi.Node) bool {
 }
 
 //TODO Make Generic with Service
-func sendNodeWork(action KubeWorkAction, queue chan<- KubeWork, oldObject,newObject interface{}) {
+func sendNodeWork(action KubeWorkAction, queue chan<- KubeWork, oldObject, newObject interface{}) {
 	if node, ok := newObject.(*kapi.Node); ok {
-		glog.V(4).Info("Node Action: ", action, " for node ", node.Name)
-		work := KubeWork {
-			Action: action,
-			Node: node,
+		if nodeSelector.Matches(labels.Set(node.Labels)) == false {
+			glog.V(2).Infof("Ignoring node %s due to label selectors", node.Name)
+			return
 		}
 
-		if action == KubeWorkUpdateNode{
+		glog.V(4).Info("Node Action: ", action, " for node ", node.Name)
+		work := KubeWork{
+			Action: action,
+			Node:   node,
+		}
+
+		if action == KubeWorkUpdateNode {
 			if oldNode, ok := oldObject.(*kapi.Node); ok {
 				if nodeReady(node) != nodeReady(oldNode) {
 					glog.V(4).Info("Ready state change. Old:", nodeReady(oldNode), " New: ", nodeReady(node))
@@ -192,7 +201,7 @@ func sendNodeWork(action KubeWorkAction, queue chan<- KubeWork, oldObject,newObj
 				}
 			}
 		} else {
-				queue <-work
+			queue <- work
 		}
 	}
 }
@@ -202,7 +211,7 @@ func sendServiceWork(action KubeWorkAction, queue chan<- KubeWork, serviceObj in
 	if service, ok := serviceObj.(*kapi.Service); ok {
 		glog.V(4).Info("Service Action: ", action, " for service ", service.Name)
 		queue <- KubeWork{
-			Action: action,
+			Action:  action,
 			Service: service,
 		}
 	}
@@ -215,13 +224,13 @@ func watchForNodes(kubeClient *kclient.Client, queue chan<- KubeWork) {
 		&kapi.Node{},
 		resyncPeriod,
 		kframework.ResourceEventHandlerFuncs{
-			AddFunc:    func(obj interface{}) {
+			AddFunc: func(obj interface{}) {
 				sendNodeWork(KubeWorkAddNode, queue, nil, obj)
 			},
 			DeleteFunc: func(obj interface{}) {
 				sendNodeWork(KubeWorkRemoveNode, queue, nil, obj)
 			},
-			UpdateFunc: func(newObj,oldObj interface{}) {
+			UpdateFunc: func(newObj, oldObj interface{}) {
 				sendNodeWork(KubeWorkUpdateNode, queue, oldObj, newObj)
 			},
 		},
@@ -236,14 +245,14 @@ func watchForServices(kubeClient *kclient.Client, queue chan<- KubeWork) {
 		&kapi.Service{},
 		resyncPeriod,
 		kframework.ResourceEventHandlerFuncs{
-			AddFunc:    func(obj interface{}) {
+			AddFunc: func(obj interface{}) {
 				sendServiceWork(KubeWorkAddService, queue, obj)
 			},
 			DeleteFunc: func(obj interface{}) {
 				sendServiceWork(KubeWorkRemoveService, queue, obj)
 			},
-			UpdateFunc: func(newObj,oldObj interface{}) {
-				if reflect.DeepEqual(newObj,oldObj) == false {
+			UpdateFunc: func(newObj, oldObj interface{}) {
+				if reflect.DeepEqual(newObj, oldObj) == false {
 					sendServiceWork(KubeWorkUpdateService, queue, newObj)
 				}
 			},
@@ -266,6 +275,12 @@ func main() {
 	} else {
 		glog.Info("Connected to K8S API Server")
 	}
+
+	nodeSelector, err = labels.Parse(*argNodeSelector)
+	if err != nil {
+		glog.Fatal("Could not parse node label selector. Error:", err)
+	}
+
 	//Attempt to create Consul Client (All ways needed so that channels are not blocked)
 	var consulClient *consulapi.Client
 	if *argDryRun == false {
@@ -287,28 +302,28 @@ func main() {
 		glog.Info("Running Consul Sync loop every: ", *argConsulSync, " seconds")
 		syncer := time.NewTicker(time.Second * time.Duration(*argConsulSync))
 
-	  go func() {
-	    for t := range syncer.C {
-	      glog.V(4).Info("Consul Sync request at:", t)
-	      consulWorkQueue <- ConsulWork {
+		go func() {
+			for t := range syncer.C {
+				glog.V(4).Info("Consul Sync request at:", t)
+				consulWorkQueue <- ConsulWork{
 					Action: ConsulWorkSyncDNS,
 				}
-	    }
-	  }()
+			}
+		}()
 	}
 
 	if *argKubeSync > 0 {
 		glog.Info("Running Kube Sync loop every: ", *argConsulSync, " seconds")
 		syncer := time.NewTicker(time.Second * time.Duration(*argKubeSync))
 
-	  go func() {
-	    for t := range syncer.C {
-	      glog.V(4).Info("Kube Sync request at:", t)
-	      kubeWorkQueue <- KubeWork {
+		go func() {
+			for t := range syncer.C {
+				glog.V(4).Info("Kube Sync request at:", t)
+				kubeWorkQueue <- KubeWork{
 					Action: KubeWorkSync,
 				}
-	    }
-	  }()
+			}
+		}()
 	}
 
 	// Prevent exit
